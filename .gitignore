@@ -1,0 +1,5 @@
+.streamlit/secrets.toml
+Database_Project_Dataset/
+__pycache__/
+*.pyc
+.env
