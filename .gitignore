@@ -3,3 +3,4 @@ Database_Project_Dataset/
 __pycache__/
 *.pyc
 .env
+*.log
