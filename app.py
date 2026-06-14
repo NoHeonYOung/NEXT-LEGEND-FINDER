@@ -1,4 +1,4 @@
-import json
+﻿import json
 import tomllib
 from pathlib import Path
 
@@ -6,6 +6,13 @@ import altair as alt
 import pandas as pd
 import psycopg
 import streamlit as st
+
+from services.db import get_prospect_diagnostics, get_scouting_notes, insert_scouting_note, query_df, query_one, show_db_error, table_count, preview_table, search_players, search_players_with_modes, get_distinct_positions, get_player, get_valuations, get_profile_by_player_id, get_profile_by_name, get_player_profile, get_similar_players, money
+from ui.components import apply_theme as apply_ui_theme, render_feature_card, render_metric_cards, render_status_banner, safe_text
+from ui.navigation import init_navigation_state, navigate_to, render_app_header
+from views.db_status import render_db_status as render_db_status_view
+from views.home import render_home as render_home_view
+from views.prospect_search import render_prospect_search as render_prospect_search_view
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -46,12 +53,12 @@ def load_db_url():
 
 
 @st.cache_resource
-def get_connection():
-    return psycopg.connect(load_db_url())
+def get_connection(db_url):
+    return psycopg.connect(db_url, connect_timeout=10)
 
 
 def query_df(sql, params=None):
-    conn = get_connection()
+    conn = get_connection(load_db_url())
 
     with conn.cursor() as cur:
         cur.execute(sql, params or ())
@@ -62,7 +69,7 @@ def query_df(sql, params=None):
 
 
 def query_one(sql, params=None):
-    conn = get_connection()
+    conn = get_connection(load_db_url())
 
     with conn.cursor() as cur:
         cur.execute(sql, params or ())
@@ -76,7 +83,7 @@ def query_one(sql, params=None):
 
 
 def execute_one(sql, params=None):
-    conn = get_connection()
+    conn = get_connection(load_db_url())
 
     with conn.cursor() as cur:
         cur.execute(sql, params or ())
@@ -89,6 +96,29 @@ def execute_one(sql, params=None):
         return None
 
     return dict(zip(columns, row))
+
+
+def show_db_error(action, exc):
+    message = str(exc)
+    lowered = message.lower()
+    st.error(f"{action} 중 DB 연결 또는 조회 오류가 발생했습니다.")
+
+    if "tenant/user" in lowered and "not found" in lowered:
+        st.warning(
+            "Supabase Pooler가 연결 문자열의 프로젝트 참조값을 찾지 못했습니다. "
+            "Supabase Dashboard에서 현재 프로젝트를 연 뒤 Connect > Session pooler 연결 문자열을 "
+            "다시 복사하여 `.streamlit/secrets.toml`의 `SUPABASE_DB_URL`을 교체하고 앱을 재시작해 주세요."
+        )
+    elif "password authentication failed" in lowered:
+        st.warning(
+            "DB 비밀번호 인증에 실패했습니다. Supabase Dashboard의 현재 DB 비밀번호를 확인하거나 "
+            "비밀번호를 재설정한 뒤 `SUPABASE_DB_URL`을 갱신해 주세요."
+        )
+    else:
+        st.info("Supabase 프로젝트 상태와 `.streamlit/secrets.toml`의 `SUPABASE_DB_URL`을 확인해 주세요.")
+
+    with st.expander("개발자용 DB 오류 보기"):
+        st.code(message)
 
 
 def table_count(table_name):
@@ -109,8 +139,12 @@ def preview_table(table_name, limit=50):
 
 def search_players(keyword="", position="", nationality="", club="", max_age=23):
     player_name = "coalesce(p.name, pp.name)"
-    conditions = ["pp.age is not null", "pp.age <= %s"]
-    params = [max_age]
+    conditions = []
+    params = []
+
+    if max_age is not None:
+        conditions.append("(pp.age is null or pp.age <= %s)")
+        params.append(max_age)
 
     if keyword:
         conditions.append(f"{player_name} ilike %s")
@@ -131,6 +165,7 @@ def search_players(keyword="", position="", nationality="", club="", max_age=23)
     sql = f"""
         select
             p.player_id,
+            pp.profile_id,
             {player_name} as name,
             pp.age,
             p.current_club_name,
@@ -140,26 +175,116 @@ def search_players(keyword="", position="", nationality="", club="", max_age=23)
             p.market_value_in_eur,
             p.image_url
         from players p
-        join player_profiles pp
+        left join player_profiles pp
             on pp.player_id = p.player_id
-        where {" and ".join(conditions)}
+        where {" and ".join(conditions) if conditions else "1=1"}
         order by p.market_value_in_eur desc nulls last
-        limit 50
+        limit 100
     """
 
     return query_df(sql, tuple(params))
+
+
+def search_players_with_modes(keyword="", position="", nationality="", club="", max_age=23):
+    matched = search_players(keyword=keyword, position=position, nationality=nationality, club=club, max_age=max_age)
+    matched = matched.copy()
+    matched["search_mode"] = "matched"
+    matched["source_label"] = "통합 분석 가능 후보"
+
+    conditions = ["pp.age is not null", "pp.age <= %s"]
+    params = [max_age]
+
+    if keyword:
+        conditions.append("pp.name ilike %s")
+        params.append(f"%{keyword}%")
+    if position and position != "All":
+        conditions.append("pp.position = %s")
+        params.append(position)
+    if nationality:
+        conditions.append("pp.nationality ilike %s")
+        params.append(f"%{nationality}%")
+    if club:
+        conditions.append("pp.club ilike %s")
+        params.append(f"%{club}%")
+
+    fm_only_sql = f"""
+        select
+            'fm_profile_only' as search_mode,
+            null::bigint as player_id,
+            pp.profile_id,
+            pp.name,
+            pp.age,
+            pp.club as current_club_name,
+            pp.nationality as country_of_citizenship,
+            pp.position,
+            null::text as sub_position,
+            null::bigint as market_value_in_eur,
+            null::text as image_url,
+            'FM 프로필 기반 후보' as source_label
+        from player_profiles pp
+        left join players p on p.player_id = pp.player_id
+        where p.player_id is null
+          and {" and ".join(conditions)}
+        order by pp.age asc nulls last, pp.name asc
+        limit 100
+    """
+    fm_only = query_df(fm_only_sql, tuple(params))
+
+    transfermarkt_conditions = ["p.player_id is not null"]
+    transfermarkt_params = []
+    if keyword:
+        transfermarkt_conditions.append("p.name ilike %s")
+        transfermarkt_params.append(f"%{keyword}%")
+    if position and position != "All":
+        transfermarkt_conditions.append("p.position = %s")
+        transfermarkt_params.append(position)
+    if nationality:
+        transfermarkt_conditions.append("p.country_of_citizenship ilike %s")
+        transfermarkt_params.append(f"%{nationality}%")
+    if club:
+        transfermarkt_conditions.append("p.current_club_name ilike %s")
+        transfermarkt_params.append(f"%{club}%")
+    if max_age is not None:
+        transfermarkt_conditions.append("(p.date_of_birth is null or age(p.date_of_birth) < interval '23 years' or age(p.date_of_birth) <= interval '%s years')")
+        transfermarkt_params.append(f"{max_age}")
+
+    transfermarkt_sql = f"""
+        select
+            'transfermarkt_only' as search_mode,
+            p.player_id,
+            null::bigint as profile_id,
+            p.name,
+            null::integer as age,
+            p.current_club_name,
+            p.country_of_citizenship,
+            p.position,
+            p.sub_position,
+            p.market_value_in_eur,
+            p.image_url,
+            'Transfermarkt 기반 후보' as source_label
+        from players p
+        left join player_profiles pp on pp.player_id = p.player_id
+        where pp.player_id is null
+          and {" and ".join(transfermarkt_conditions)}
+        order by p.market_value_in_eur desc nulls last
+        limit 100
+    """
+    transfermarkt = query_df(transfermarkt_sql, tuple(transfermarkt_params))
+
+    combined = pd.concat([matched, fm_only, transfermarkt], ignore_index=True, sort=False)
+    combined = combined.where(pd.notna(combined), None)
+    return combined
 
 
 def get_distinct_positions(max_age=23):
     sql = """
         select distinct p.position
         from players p
-        join player_profiles pp
+        left join player_profiles pp
             on pp.player_id = p.player_id
         where p.position is not null
           and p.position <> ''
-          and pp.age is not null
-          and pp.age <= %s
+          and (pp.age is null or pp.age <= %s)
         order by p.position
     """
     df = query_df(sql, (max_age,))
@@ -234,14 +359,44 @@ def get_profile_by_name(name):
     return query_one(sql, (f"%{name}%",))
 
 
+def get_profile_by_name_nationality_position(name, nationality=None, position=None):
+    if not name:
+        return None
+
+    conditions = ["name ilike %s"]
+    params = [f"%{name}%"]
+
+    if nationality:
+        conditions.append("nationality ilike %s")
+        params.append(f"%{nationality}%")
+
+    if position:
+        conditions.append("position = %s")
+        params.append(position)
+
+    sql = f"""
+        select *
+        from player_profiles
+        where {" and ".join(conditions)}
+        order by age asc nulls last
+        limit 1
+    """
+
+    return query_one(sql, tuple(params))
+
+
 def get_player_profile(player):
     if not player:
         return None
 
-    profile = get_profile_by_player_id(player["player_id"])
+    try:
+        profile = get_profile_by_player_id(player["player_id"])
 
-    if profile is None:
-        profile = get_profile_by_name(player["name"])
+        if profile is None:
+            profile = get_profile_by_name(player["name"])
+    except Exception:
+        st.error("선수 프로필을 DB에서 조회하는 중 오류가 발생했습니다.")
+        return None
 
     return profile
 
@@ -326,6 +481,70 @@ def get_scouting_notes(limit=20):
     return query_df(sql, (limit,))
 
 
+def get_prospect_diagnostics():
+    players_total = query_one("select count(*) as count from players")
+    profiles_total = query_one("select count(*) as count from player_profiles")
+    matched_total = query_one("""
+        select count(*) as count
+        from players p
+        join player_profiles pp on pp.player_id = p.player_id
+    """)
+    players_without_profiles = query_one("""
+        select count(*) as count
+        from players p
+        left join player_profiles pp on pp.player_id = p.player_id
+        where pp.player_id is null
+    """)
+    profiles_without_players = query_one("""
+        select count(*) as count
+        from player_profiles pp
+        left join players p on p.player_id = pp.player_id
+        where p.player_id is null
+    """)
+    age_covered = query_one("""
+        select count(*) as count
+        from player_profiles
+        where age is not null
+    """)
+    young_players_from_dob = query_one("""
+        select count(*) as count
+        from players
+        where date_of_birth is not null
+          and age(date_of_birth) < interval '23 years'
+    """)
+    young_profiles = query_one("""
+        select count(*) as count
+        from player_profiles
+        where age is not null
+          and age <= 23
+    """)
+
+    players_total = int(players_total["count"]) if players_total else 0
+    profiles_total = int(profiles_total["count"]) if profiles_total else 0
+    matched_total = int(matched_total["count"]) if matched_total else 0
+    players_without_profiles = int(players_without_profiles["count"]) if players_without_profiles else 0
+    profiles_without_players = int(profiles_without_players["count"]) if profiles_without_players else 0
+    age_covered = int(age_covered["count"]) if age_covered else 0
+    young_players_from_dob = int(young_players_from_dob["count"]) if young_players_from_dob else 0
+    young_profiles = int(young_profiles["count"]) if young_profiles else 0
+
+    coverage_ratio = (matched_total / players_total) if players_total else 0.0
+    profile_coverage_ratio = (age_covered / profiles_total) if profiles_total else 0.0
+
+    return {
+        "players_total": players_total,
+        "profiles_total": profiles_total,
+        "matched_total": matched_total,
+        "players_without_profiles": players_without_profiles,
+        "profiles_without_players": profiles_without_players,
+        "age_covered": age_covered,
+        "young_players_from_dob": young_players_from_dob,
+        "young_profiles": young_profiles,
+        "coverage_ratio": coverage_ratio,
+        "profile_coverage_ratio": profile_coverage_ratio,
+    }
+
+
 def money(value):
     if value is None or pd.isna(value):
         return "-"
@@ -336,17 +555,130 @@ def money(value):
         return str(value)
 
 
+def resolve_selected_player_context():
+    """현재 세션에 선택된 선수의 player_id/profile_id/entity_type을
+    실제 DB 매칭 상태와 일치하도록 정리해서 반환한다.
+
+    - player_id와 profile_id가 모두 있으면 matched
+    - profile_id만 있으면 fm_profile_only
+    - player_id만 있고 profile_id가 없으면, name/nationality/position 기반으로
+      player_profiles 보조 매칭을 한 번 시도한다. 매칭되면 matched로 승격하고
+      session_state의 selected_profile_id를 채워준다. 매칭되지 않으면
+      transfermarkt_only로 처리한다.
+    """
+    raw_player_id = st.session_state.get("selected_player_id")
+    raw_profile_id = st.session_state.get("selected_profile_id")
+
+    player_id = int(raw_player_id) if raw_player_id is not None else None
+    profile_id = int(raw_profile_id) if raw_profile_id is not None else None
+    fallback_note = None
+
+    if player_id is not None and profile_id is None:
+        try:
+            profile = get_profile_by_player_id(player_id)
+        except Exception:
+            profile = None
+
+        if profile is None:
+            try:
+                player = get_player(player_id)
+            except Exception:
+                player = None
+
+            if player:
+                try:
+                    profile = get_profile_by_name_nationality_position(
+                        player.get("name"),
+                        player.get("country_of_citizenship"),
+                        player.get("position"),
+                    )
+                except Exception:
+                    profile = None
+
+                if profile is not None:
+                    fallback_note = (
+                        "player_id 직접 매칭은 아니지만 이름/국적/포지션 기반으로 "
+                        "FM 프로필을 보조 연결했습니다."
+                    )
+
+        if profile is not None and profile.get("profile_id") is not None:
+            profile_id = profile["profile_id"]
+            st.session_state["selected_profile_id"] = profile_id
+
+    if profile_id is not None and player_id is not None:
+        entity_type = "matched"
+    elif profile_id is not None:
+        entity_type = "fm_profile_only"
+    elif player_id is not None:
+        entity_type = "transfermarkt_only"
+    else:
+        entity_type = None
+
+    if entity_type is not None:
+        st.session_state["selected_entity_type"] = entity_type
+
+    st.session_state["selected_profile_fallback_note"] = fallback_note
+
+    return {
+        "player_id": player_id,
+        "profile_id": profile_id,
+        "entity_type": entity_type,
+        "fallback_note": fallback_note,
+    }
+
+
 def selected_player_id():
-    return st.session_state.get("selected_player_id")
+    return resolve_selected_player_context()["player_id"]
+
+
+def selected_profile_id():
+    return resolve_selected_player_context()["profile_id"]
+
+
+def selected_entity_type():
+    return resolve_selected_player_context()["entity_type"] or "matched"
+
+
+def selected_profile():
+    ctx = resolve_selected_player_context()
+    profile_id = ctx["profile_id"]
+
+    if profile_id:
+        return query_one("select * from player_profiles where profile_id = %s limit 1", (profile_id,))
+
+    return None
 
 
 def selected_player():
-    player_id = selected_player_id()
+    ctx = resolve_selected_player_context()
+
+    if ctx["entity_type"] == "fm_profile_only":
+        profile = selected_profile()
+        if profile:
+            return {
+                "player_id": None,
+                "name": profile.get("name") or "FM 프로필 기반 후보",
+                "current_club_name": profile.get("club") or "-",
+                "country_of_citizenship": profile.get("nationality") or "-",
+                "position": profile.get("position") or "-",
+                "sub_position": None,
+                "foot": None,
+                "height_in_cm": None,
+                "market_value_in_eur": None,
+                "highest_market_value_in_eur": None,
+                "image_url": None,
+            }
+
+    player_id = ctx["player_id"]
 
     if player_id is None:
         return None
 
-    return get_player(player_id)
+    try:
+        return get_player(player_id)
+    except Exception:
+        st.error("선택 선수 정보를 DB에서 조회하는 중 오류가 발생했습니다.")
+        return None
 
 
 def require_selected_player():
@@ -371,6 +703,153 @@ def show_selected_player_banner():
         f"{player.get('current_club_name') or '-'} | "
         f"{player.get('position') or '-'}"
     )
+
+
+ENTITY_TYPE_LABELS = {
+    "matched": "FM 프로필 + Transfermarkt 통합 데이터",
+    "fm_profile_only": "FM 프로필 기반 후보",
+    "transfermarkt_only": "Transfermarkt 기반 후보",
+    "manual_note": "직접 입력 기반 분석",
+    None: "선택 선수 없음",
+}
+
+DATA_MODE_BADGE_CLASS = {
+    "matched": "data-mode-badge data-mode-matched",
+    "fm_profile_only": "data-mode-badge data-mode-fm",
+    "transfermarkt_only": "data-mode-badge data-mode-tm",
+    "manual_note": "data-mode-badge data-mode-manual",
+    None: "data-mode-badge data-mode-none",
+}
+
+# 메인 메뉴(사이드바 radio)의 옵션 라벨과 반드시 일치해야 하는 nav target 목록.
+NAV_TARGETS = [
+    "홈 / 서비스 소개",
+    "유망주 검색",
+    "유망주 통합 분석",
+    "유사 선수 후보",
+    "커리어 시뮬레이션",
+    "AI 스카우팅 리포트",
+    "내 스카우팅 노트",
+    "DB 상태 확인",
+]
+
+NAV_CHIP_LABELS = {
+    "홈 / 서비스 소개": "Home",
+    "유망주 검색": "Search",
+    "유망주 통합 분석": "Analysis",
+    "유사 선수 후보": "Mentor",
+    "커리어 시뮬레이션": "Simulation",
+    "AI 스카우팅 리포트": "Report",
+    "내 스카우팅 노트": "Notes",
+    "DB 상태 확인": "DB",
+}
+
+
+def go_to(nav_target):
+    """nav_page_request를 통해 다음 렌더링에서 main()이 sidebar.radio 값을 갱신하도록 한다."""
+    st.session_state["nav_page_request"] = nav_target
+    st.rerun()
+
+
+def render_nav_chips(active_page):
+    st.markdown('<div class="nav-chip-row">', unsafe_allow_html=True)
+    cols = st.columns(len(NAV_TARGETS))
+    for col, target in zip(cols, NAV_TARGETS):
+        with col:
+            is_active = target == active_page
+            if st.button(
+                NAV_CHIP_LABELS.get(target, target),
+                key=f"navchip_{target}",
+                use_container_width=True,
+                type="primary" if is_active else "secondary",
+                disabled=is_active,
+            ):
+                go_to(target)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+
+def render_page_actions(actions, title="다음 단계"):
+    """화면 하단 '다음 단계' 버튼 그룹. actions: [(label, nav_target, type), ...]"""
+    if not actions:
+        return
+    st.markdown("---")
+    st.markdown(f'<div class="next-step-title">{title}</div>', unsafe_allow_html=True)
+    cols = st.columns(len(actions))
+    for col, action in zip(cols, actions):
+        label, target = action[0], action[1]
+        button_type = action[2] if len(action) > 2 else "secondary"
+        with col:
+            if st.button(label, key=f"pageaction_{target}_{label}", use_container_width=True, type=button_type):
+                go_to(target)
+
+
+def get_selected_player_status():
+    """Home 화면/공통 헤더에 표시할 선택 선수 상태 요약. 기존 선택 로직(selected_player 등)을 그대로 사용."""
+    player = selected_player()
+
+    if player is None:
+        return {
+            "has_player": False,
+            "name": None,
+            "club": None,
+            "position": None,
+            "entity_type": None,
+            "entity_label": None,
+            "mentor_name": st.session_state.get("selected_mentor_name"),
+        }
+
+    entity_type = selected_entity_type()
+
+    return {
+        "has_player": True,
+        "name": player.get("name") or "-",
+        "club": player.get("current_club_name") or "-",
+        "position": player.get("position") or "-",
+        "entity_type": entity_type,
+        "entity_label": ENTITY_TYPE_LABELS.get(entity_type, entity_type),
+        "mentor_name": st.session_state.get("selected_mentor_name"),
+    }
+
+
+def render_app_header(page_label):
+    """모든 화면 상단에 표시되는 공통 헤더: 브랜드, 현재 위치, 선택 선수 상태, 데이터 타입, navigation."""
+    status = get_selected_player_status()
+    entity_type = status["entity_type"]
+    data_mode_label = ENTITY_TYPE_LABELS.get(entity_type, entity_type or "선택 선수 없음")
+    badge_class = DATA_MODE_BADGE_CLASS.get(entity_type, DATA_MODE_BADGE_CLASS[None])
+
+    if status["has_player"]:
+        status_text = (
+            f"선택 선수: <b>{status['name']}</b> · {status['club']} · {status['position']}"
+        )
+        if status["mentor_name"]:
+            status_text += f" · 멘토: <b>{status['mentor_name']}</b>"
+    else:
+        status_text = "선택 선수: 아직 없음 · 유망주 검색에서 분석할 선수를 선택해 주세요."
+
+    st.markdown(
+        f"""
+        <div class="app-header">
+            <div>
+                <div class="app-header-brand">NEXT-LEGEND FINDER</div>
+                <div class="app-header-page">Scouting Center · 현재 위치: {page_label}</div>
+            </div>
+            <div class="app-header-status">
+                {status_text}<br/>
+                <span class="{badge_class}">데이터 타입: {data_mode_label}</span>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    home_col, _ = st.columns([1, 7])
+    with home_col:
+        if page_label != "홈 / 서비스 소개":
+            if st.button("🏠 Home", key="header_home_button", use_container_width=True):
+                go_to("홈 / 서비스 소개")
+
+    render_nav_chips(page_label)
 
 
 def parse_json_field(value):
@@ -834,7 +1313,8 @@ def render_prospect_search():
     with c3:
         try:
             positions = get_distinct_positions(max_age=max_age)
-        except Exception:
+        except Exception as exc:
+            show_db_error("포지션 목록 조회", exc)
             positions = ["All"]
         position = st.selectbox("포지션", positions)
 
@@ -864,9 +1344,7 @@ def render_prospect_search():
             st.session_state["prospect_results"] = results
             st.session_state["last_search_filters"] = filters
         except Exception as exc:
-            st.error("유망주 검색 중 오류가 발생했습니다.")
-            with st.expander("개발 확인용 오류"):
-                st.exception(exc)
+            show_db_error("유망주 검색", exc)
             return
 
     if "prospect_results" not in st.session_state:
@@ -907,8 +1385,20 @@ def render_prospect_search():
             unsafe_allow_html=True,
         )
         if st.button("이 선수 선택", key=f"select_prospect_{player_id}"):
+            previous_player_id = st.session_state.get("selected_player_id")
             st.session_state["selected_player_id"] = player_id
             st.session_state["selected_player_name"] = row.get("name")
+            if previous_player_id != player_id:
+                for key in [
+                    "selected_mentor_profile_id",
+                    "selected_mentor_name",
+                    "mentor_summary",
+                    "env_settings",
+                    "simulation_result",
+                    "generated_report_sections",
+                    "generated_report",
+                ]:
+                    st.session_state.pop(key, None)
             st.success("선수가 선택되었습니다. 유망주 통합 분석 화면에서 확인할 수 있습니다.")
             st.info("왼쪽 메뉴에서 '유망주 통합 분석'으로 이동하세요.")
 
@@ -2623,6 +3113,138 @@ def apply_theme():
                 grid-template-columns: 1fr;
             }
         }
+        .app-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 10px;
+            background: #17324D;
+            color: #FFFFFF;
+            border-radius: 10px;
+            padding: 14px 20px;
+            margin: 0 0 18px 0;
+            box-shadow: 0 8px 24px rgba(23, 50, 77, 0.18);
+        }
+        .app-header-brand {
+            font-size: 1.15rem;
+            font-weight: 700;
+            letter-spacing: 0.02em;
+        }
+        .app-header-page {
+            font-size: 0.9rem;
+            color: #CBD8E6;
+            margin-top: 2px;
+        }
+        .app-header-status {
+            font-size: 0.92rem;
+            color: #E7F6F3;
+            text-align: right;
+        }
+        .app-header-status b {
+            color: #FFFFFF;
+        }
+        .home-hero {
+            text-align: center;
+            margin: 4px 0 18px 0;
+        }
+        .home-hero p {
+            color: #475467;
+            font-size: 1.05rem;
+            margin-top: 6px;
+        }
+        .data-mode-badge {
+            display: inline-flex;
+            border-radius: 999px;
+            padding: 3px 10px;
+            font-size: 0.82rem;
+            font-weight: 600;
+            margin-top: 4px;
+            white-space: nowrap;
+        }
+        .data-mode-matched {
+            background: #E0F4F1;
+            color: #1F5C4D;
+        }
+        .data-mode-tm {
+            background: #DDEBFF;
+            color: #1A4480;
+        }
+        .data-mode-fm {
+            background: #FFF7D6;
+            color: #7A5D00;
+        }
+        .data-mode-manual {
+            background: #ECE5FF;
+            color: #4A2E9C;
+        }
+        .data-mode-none {
+            background: #E3E8EF;
+            color: #475467;
+        }
+        .nav-chip-row {
+            margin-bottom: 6px;
+        }
+        div[data-testid="stButton"] > button {
+            border-radius: 999px;
+        }
+        .next-step-title {
+            color: #17324D;
+            font-weight: 700;
+            font-size: 1.0rem;
+            margin: 4px 0 10px 0;
+        }
+        .workflow-step {
+            background: #FFFFFF;
+            border: 1px solid #DCE3EA;
+            border-radius: 10px;
+            padding: 14px;
+            margin-bottom: 10px;
+            box-shadow: 0 6px 18px rgba(23, 50, 77, 0.05);
+        }
+        .workflow-step .step-no {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 26px;
+            height: 26px;
+            border-radius: 50%;
+            background: #17324D;
+            color: #FFFFFF;
+            font-weight: 700;
+            font-size: 0.85rem;
+            margin-right: 8px;
+        }
+        .data-mode-card {
+            background: #FFFFFF;
+            border: 1px solid #DCE3EA;
+            border-left: 4px solid #2A9D8F;
+            border-radius: 10px;
+            padding: 14px 16px;
+            margin-bottom: 10px;
+            box-shadow: 0 6px 18px rgba(23, 50, 77, 0.05);
+        }
+        .data-mode-card.active {
+            border-left-color: #17324D;
+            background: #F0F6FF;
+        }
+        .hero-cta {
+            background: linear-gradient(135deg, #17324D 0%, #102335 100%);
+            color: #FFFFFF;
+            border-radius: 12px;
+            padding: 22px 24px;
+            margin: 4px 0 18px 0;
+            box-shadow: 0 10px 28px rgba(16, 35, 53, 0.25);
+        }
+        .hero-cta h1 {
+            color: #FFFFFF;
+            margin: 0 0 6px 0;
+        }
+        .hero-cta p {
+            color: #CBD8E6;
+            font-size: 1.0rem;
+            margin: 0;
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -2867,97 +3489,125 @@ def group_analysis(attributes, group, keys):
 
 def render_dashboard():
     st.title("유망주 통합 분석 대시보드")
-    player = require_selected_player()
-    if player is None:
+    ctx = resolve_selected_player_context()
+    entity_type = selected_entity_type()
+    player = selected_player()
+    profile = selected_profile()
+
+    if player is None and profile is None:
+        st.warning("먼저 Prospect Search에서 선수를 선택해 주세요.")
         return
-    profile = get_player_profile(player)
+
     render_player_profile_panel(player, profile)
-    if profile is None:
-        st.warning("연결된 FM 프로필 데이터가 없어 스타일 요약을 표시할 수 없습니다.")
-        return
-    attributes = parse_json_field(profile.get("attributes_jsonb"))
-    mentality = parse_json_field(profile.get("mentality_jsonb"))
 
-    st.subheader("분석 요약")
-    st.caption("아래 지표는 공식 평가가 아니라 FM 기반 proxy 데이터를 요약한 prototype summary입니다.")
-    render_metric_cards(summary_scores(attributes, mentality))
+    if ctx["fallback_note"]:
+        st.info(ctx["fallback_note"])
 
-    st.subheader("FM 기반 스타일 요약")
-    for group, keys in ATTRIBUTE_GROUPS.items():
-        avg, highs, lows = group_analysis(attributes, group, keys)
-        c1, c2 = st.columns([0.85, 1.4])
-        with c1:
-            st.markdown(
-                f"""
-                <div class="scout-panel">
-                    <h3 style="margin-top: 0;">{group}</h3>
-                    <div class="muted">그룹 평균 점수</div>
-                    <h2 style="color:#1F5C4D; margin: 4px 0;">{score_text(avg)}</h2>
-                    <b>주요 강점</b><br>{strength_sentence(highs)}<br><br>
-                    <b>보완점</b><br>{weakness_sentence(lows)}
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-        with c2:
-            attr_bar_chart(attributes_long_df(attributes, {group: keys}), height=190)
+    if entity_type == "matched":
+        st.info("matched 모드: players + player_profiles + player_valuations + appearances를 함께 확인할 수 있습니다.")
+    elif entity_type == "fm_profile_only":
+        st.info("fm_profile_only 모드: FM 프로필 기반 후보입니다. Transfermarkt 시장가치/출전 기록은 매칭되지 않아 표시할 수 없습니다.")
+    else:
+        st.info("transfermarkt_only 모드: Transfermarkt 기반 후보입니다. FM 스타일·멘탈 분석은 표시할 수 없습니다.")
 
-    st.subheader("멘탈리티 분석")
-    st.info("현재 멘탈리티 평가는 기사/스카우팅 원문 분석이 아닌 FM 속성 기반의 대체 지표입니다. 실제 선수 성격을 단정하기보다 데이터 기반 프로토타입 해석으로 활용합니다.")
-    basis = mentality.get("basis", {}) if isinstance(mentality, dict) else {}
-    mental_score = mentality.get("mentality_score") if isinstance(mentality, dict) else None
-    m1, m2 = st.columns([0.75, 1.45])
-    with m1:
-        st.metric("멘탈 종합 점수", "-" if mental_score is None else mental_score)
-        mental_highs = top_attributes(basis, MENTALITY_KEYS, 3, True)
-        mental_lows = top_attributes(basis, MENTALITY_KEYS, 2, False)
-        st.markdown('<div class="scout-panel"><b>멘탈 강점</b><br>' + strength_sentence(mental_highs) + '</div>', unsafe_allow_html=True)
-        st.markdown('<div class="scout-panel"><b>보완이 필요한 부분</b><br>' + weakness_sentence(mental_lows) + '</div>', unsafe_allow_html=True)
-    with m2:
-        attr_bar_chart(attributes_long_df(basis, {"멘탈리티": MENTALITY_KEYS}), height=320)
-    st.markdown(
-        f'<div class="section-note"><b>스카우팅 코멘트</b><br>{strength_sentence(mental_highs)} {weakness_sentence(mental_lows)} 이 해석은 실제 AI 분석이 아니라 FM 속성 기반 proxy 분석입니다.</div>',
-        unsafe_allow_html=True,
-    )
+    has_profile = isinstance(profile, dict) and profile.get("profile_id") is not None
+    has_player_id = isinstance(player, dict) and player.get("player_id") is not None
 
-    st.subheader("시장가치 변화와 최근 출전 기록")
-    c1, c2 = st.columns([1.1, 1])
-    with c1:
-        valuations = get_valuations(player["player_id"])
-        if valuations.empty:
-            st.info("시장가치 데이터가 없습니다.")
-        else:
-            valuations["date"] = pd.to_datetime(valuations["date"])
-            valuations["market_value_in_eur"] = pd.to_numeric(valuations["market_value_in_eur"], errors="coerce")
-            clean = valuations.dropna(subset=["market_value_in_eur"])
-            if clean.empty:
-                st.info("표시할 시장가치 데이터가 없습니다.")
-            else:
-                chart = (
-                    alt.Chart(clean)
-                    .mark_line(point=True, color="#2A9D8F", strokeWidth=3)
-                    .encode(
-                        x=alt.X("date:T", title="날짜"),
-                        y=alt.Y("market_value_in_eur:Q", title="시장가치(EUR)"),
-                        tooltip=[
-                            alt.Tooltip("date:T", title="날짜"),
-                            alt.Tooltip("market_value_in_eur:Q", title="시장가치"),
-                            alt.Tooltip("current_club_name:N", title="소속팀"),
-                        ],
-                    )
-                    .properties(height=260)
+    if entity_type in ("matched", "fm_profile_only") and has_profile:
+        attributes = parse_json_field(profile.get("attributes_jsonb"))
+        mentality = parse_json_field(profile.get("mentality_jsonb"))
+
+        st.subheader("분석 요약")
+        st.caption("아래 지표는 FM 기반 proxy 데이터를 요약한 prototype summary입니다.")
+        render_metric_cards(summary_scores(attributes, mentality))
+
+        st.subheader("FM 기반 스타일 요약")
+        for group, keys in ATTRIBUTE_GROUPS.items():
+            avg, highs, lows = group_analysis(attributes, group, keys)
+            c1, c2 = st.columns([0.85, 1.4])
+            with c1:
+                st.markdown(
+                    f"""
+                    <div class="scout-panel">
+                        <h3 style="margin-top: 0;">{group}</h3>
+                        <div class="muted">그룹 평균 점수</div>
+                        <h2 style="color:#1F5C4D; margin: 4px 0;">{score_text(avg)}</h2>
+                        <b>주요 강점</b><br>{strength_sentence(highs)}<br><br>
+                        <b>보완점</b><br>{weakness_sentence(lows)}
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
                 )
-                st.altair_chart(chart, use_container_width=True)
-    with c2:
-        appearances = get_appearances(player["player_id"], limit=10)
-        if appearances.empty:
-            st.info("최근 출전 기록이 없습니다.")
-        else:
-            st.caption("최근 10경기 기준 출전 기록입니다.")
-            st.dataframe(korean_appearances(appearances), use_container_width=True, hide_index=True)
+            with c2:
+                attr_bar_chart(attributes_long_df(attributes, {group: keys}), height=190)
 
-    with st.expander("개발자용 원본 데이터 보기"):
-        st.json({"attributes_jsonb": attributes, "mentality_jsonb": mentality})
+        st.subheader("멘탈리티 분석")
+        st.info("현재 멘탈리티 평가는 기사/스카우팅 원문 분석이 아닌 FM 속성 기반의 대체 지표입니다.")
+
+        basis = mentality.get("basis", {}) if isinstance(mentality, dict) else {}
+        mental_score = mentality.get("mentality_score") if isinstance(mentality, dict) else None
+        m1, m2 = st.columns([0.75, 1.45])
+        with m1:
+            st.metric("멘탈 종합 점수", "-" if mental_score is None else mental_score)
+            mental_highs = top_attributes(basis, MENTALITY_KEYS, 3, True)
+            mental_lows = top_attributes(basis, MENTALITY_KEYS, 2, False)
+            st.markdown('<div class="scout-panel"><b>멘탈 강점</b><br>' + strength_sentence(mental_highs) + '</div>', unsafe_allow_html=True)
+            st.markdown('<div class="scout-panel"><b>보완이 필요한 부분</b><br>' + weakness_sentence(mental_lows) + '</div>', unsafe_allow_html=True)
+        with m2:
+            attr_bar_chart(attributes_long_df(basis, {"멘탈리티": MENTALITY_KEYS}), height=320)
+
+    elif entity_type in ("matched", "fm_profile_only"):
+        st.warning("FM 프로필이 없어 스타일/멘탈 분석은 표시할 수 없습니다.")
+
+    if entity_type in ("matched", "transfermarkt_only") and has_player_id:
+        st.subheader("시장가치 변화와 최근 출전 기록")
+        c1, c2 = st.columns([1.1, 1])
+        with c1:
+            valuations = get_valuations(player["player_id"])
+            if valuations.empty:
+                st.info("시장가치 데이터가 없습니다.")
+            else:
+                valuations["date"] = pd.to_datetime(valuations["date"])
+                valuations["market_value_in_eur"] = pd.to_numeric(valuations["market_value_in_eur"], errors="coerce")
+                clean = valuations.dropna(subset=["market_value_in_eur"])
+                if clean.empty:
+                    st.info("표시할 시장가치 데이터가 없습니다.")
+                else:
+                    chart = (
+                        alt.Chart(clean)
+                        .mark_line(point=True, color="#2A9D8F", strokeWidth=3)
+                        .encode(
+                            x=alt.X("date:T", title="날짜"),
+                            y=alt.Y("market_value_in_eur:Q", title="시장가치(EUR)"),
+                            tooltip=["date:T", "market_value_in_eur:Q", "current_club_name:N"],
+                        )
+                        .properties(height=260)
+                    )
+                    st.altair_chart(chart, use_container_width=True)
+        with c2:
+            appearances = get_appearances(player["player_id"], limit=10)
+            if appearances.empty:
+                st.info("최근 출전 기록이 없습니다.")
+            else:
+                st.caption("최근 10경기 기준 출전 기록입니다.")
+                st.dataframe(korean_appearances(appearances), use_container_width=True, hide_index=True)
+    else:
+        st.info("Transfermarkt 데이터와 매칭되지 않아 시장가치 변화와 최근 출전 기록 영역은 표시할 수 없습니다.")
+
+    if has_profile and entity_type == "matched":
+        with st.expander("개발자용 원본 데이터 보기"):
+            st.json({"attributes_jsonb": parse_json_field(profile.get("attributes_jsonb")), "mentality_jsonb": parse_json_field(profile.get("mentality_jsonb"))})
+
+    if entity_type in ("matched", "fm_profile_only") and has_profile:
+        render_page_actions([
+            ("🤝 유사 멘토 찾기", "유사 선수 후보", "primary"),
+            ("📈 커리어 시뮬레이션 시작", "커리어 시뮬레이션"),
+        ])
+    else:
+        render_page_actions([
+            ("📝 My Scouting Notes에서 직접 분석 보완", "내 스카우팅 노트", "primary"),
+            ("📈 커리어 시뮬레이션 시작", "커리어 시뮬레이션"),
+        ], title="시장가치/출전 기록 기반 · 다음 단계")
 
 
 def get_profile_by_profile_id(profile_id):
@@ -2990,15 +3640,21 @@ def similarity_reason(base_profile, candidate_profile):
 
 def render_legend_matching():
     st.title("유사 선수 후보")
-    player = require_selected_player()
-    if player is None:
+    entity_type = selected_entity_type()
+    player = selected_player()
+    profile = selected_profile()
+
+    if player is None and profile is None:
+        st.warning("먼저 Prospect Search에서 선수를 선택해 주세요.")
         return
-    profile = get_player_profile(player)
+
     render_player_profile_panel(player, profile)
     st.info("현재 매칭은 실제 10x10 Grid 데이터가 아니라 FM 기반 proxy style_vector(24차원)를 활용한 pgvector 유사 선수 후보입니다.")
-    if profile is None:
-        st.warning("FM 프로필 데이터가 없어 유사 선수 후보를 조회할 수 없습니다.")
+
+    if entity_type == "transfermarkt_only" or not isinstance(profile, dict) or profile.get("profile_id") is None:
+        st.warning("FM 프로필이 없어 유사 선수 후보를 계산할 수 없습니다. Transfermarkt 기반 후보에서는 FM 벡터 유사도 분석을 제공할 수 없습니다.")
         return
+
     try:
         similar = get_similar_players(profile["profile_id"])
     except Exception as exc:
@@ -3006,9 +3662,11 @@ def render_legend_matching():
         with st.expander("개발 확인용 오류"):
             st.exception(exc)
         return
+
     if similar.empty:
         st.info("유사 선수 후보가 없습니다.")
         return
+
     for row in similar.to_dict("records"):
         candidate_profile = get_profile_by_profile_id(row.get("profile_id"))
         common, diff, recommendation = similarity_reason(profile, candidate_profile)
@@ -3151,32 +3809,54 @@ def sections_to_report_text(sections):
 
 def render_ai_report():
     st.title("AI 스카우팅 리포트 초안")
-    player = require_selected_player()
-    if player is None:
+    entity_type = selected_entity_type()
+    player = selected_player()
+    profile = selected_profile()
+
+    if player is None and profile is None:
+        st.warning("먼저 Prospect Search에서 선수를 선택해 주세요.")
         return
-    profile = get_player_profile(player)
+
     env_settings = st.session_state.get("env_settings")
     simulation_result = st.session_state.get("simulation_result")
     if env_settings is None or simulation_result is None:
         st.warning("먼저 커리어 시뮬레이션 화면에서 시뮬레이션 설정을 생성해 주세요.")
         return
+
     render_player_profile_panel(player, profile)
     st.info("현재 리포트는 실제 Gemini API 호출 결과가 아니라, 선택 선수와 시뮬레이션 설정값을 바탕으로 생성한 템플릿 기반 초안입니다.")
+
+    if entity_type == "matched":
+        st.info("matched 모드: players + player_profiles + 시뮬레이션 결과를 함께 반영한 리포트 초안을 생성합니다.")
+    elif entity_type == "fm_profile_only":
+        st.info("fm_profile_only 모드: FM 프로필 기반 스타일/멘탈리티를 우선 반영하고, Transfermarkt 값은 제한적으로만 참고합니다.")
+    else:
+        st.info("transfermarkt_only 모드: Transfermarkt 기본 정보와 시장가치/출전 기록을 중심으로 리포트를 생성합니다. FM 분석은 제한됩니다.")
+
+    if entity_type == "transfermarkt_only":
+        st.warning("이 후보는 FM 프로필이 없어 FM 스타일·멘탈 분석은 제외하고, 시장가치·출전 기록과 기본 정보 중심으로만 예시 리포트를 생성합니다.")
+
     if st.button("리포트 초안 생성", type="primary"):
         sections = get_report_sections(player, profile, env_settings, simulation_result)
         st.session_state["generated_report_sections"] = sections
         st.session_state["generated_report"] = sections_to_report_text(sections)
+
     sections = st.session_state.get("generated_report_sections")
     report = st.session_state.get("generated_report")
     if not sections:
         return
+
     for title in ["종합 평가", "강점", "보완점", "훈련 제안", "커리어 조언", "저장 정보"]:
         st.markdown(f'<div class="report-block"><h3 style="margin-top:0;">{title}</h3>{sections.get(title, "")}</div>', unsafe_allow_html=True)
+
     if st.button("스카우팅 노트에 저장"):
+        if not isinstance(player, dict) or player.get("player_id") is None:
+            st.warning("해당 후보는 player_id가 없어 스카우팅 노트 저장이 불가능합니다.")
+            return
         try:
             saved = insert_scouting_note(
                 player_id=player["player_id"],
-                profile_id=profile.get("profile_id") if profile else None,
+                profile_id=profile.get("profile_id") if isinstance(profile, dict) else None,
                 env_settings=env_settings,
                 simulation_result=simulation_result,
                 report=report,
@@ -3199,9 +3879,500 @@ def note_summary_text(note):
     )
 
 
+def safe_text(value, fallback="이름 없는 직접 입력 노트"):
+    if value is None:
+        return fallback
+    if isinstance(value, float) and pd.isna(value):
+        return fallback
+    if isinstance(value, str):
+        cleaned = value.strip()
+        return cleaned if cleaned else fallback
+    if pd.isna(value):
+        return fallback
+    return str(value)
+
+
+def get_career_settings(env_settings):
+    if not isinstance(env_settings, dict):
+        return {}
+
+    career_settings = env_settings.get("career_settings")
+    if isinstance(career_settings, dict):
+        return career_settings
+
+    legacy = {}
+    for key in ["training_intensity", "playing_time_opportunity", "league_difficulty", "career_choice", "risk_level"]:
+        if key in env_settings:
+            legacy[key] = env_settings.get(key)
+
+    nested = env_settings.get("env_settings") if isinstance(env_settings.get("env_settings"), dict) else None
+    if isinstance(nested, dict):
+        nested_career = nested.get("career_settings")
+        if isinstance(nested_career, dict):
+            return nested_career
+        for key in ["training_intensity", "playing_time_opportunity", "league_difficulty", "career_choice", "risk_level"]:
+            if key in nested and key not in legacy:
+                legacy[key] = nested.get(key)
+
+    return legacy
+
+
+def normalize_env_settings(env_settings):
+    if not isinstance(env_settings, dict):
+        return {"note_type": "manual_custom_prospect", "career_settings": {}}
+
+    career_settings = get_career_settings(env_settings)
+    normalized = {
+        "note_type": env_settings.get("note_type", "manual_custom_prospect"),
+        "manual_player": env_settings.get("manual_player") if isinstance(env_settings.get("manual_player"), dict) else {},
+        "manual_attributes": env_settings.get("manual_attributes") if isinstance(env_settings.get("manual_attributes"), dict) else {},
+        "career_settings": career_settings,
+        "selected_mentor_profile_id": env_settings.get("selected_mentor_profile_id"),
+        "selected_mentor_name": env_settings.get("selected_mentor_name"),
+    }
+    return normalized
+
+
+def setting_summary(key, value):
+    if key == "training_intensity":
+        number = safe_float(value, None)
+        if number is None:
+            return "훈련 강도: 정보 없음"
+        if number >= 1.4:
+            return "훈련 강도: 높음 — 빠른 성장을 기대할 수 있지만 피로 누적과 부상 위험이 증가할 수 있습니다."
+        if number >= 0.9:
+            return "훈련 강도: 보통 — 성장과 회복의 균형이 좋은 안정적 선택입니다."
+        return "훈련 강도: 낮음 — 부상 위험은 낮지만 단기 성장 속도가 느릴 수 있습니다."
+
+    if key == "playing_time_opportunity":
+        number = safe_float(value, None)
+        if number is None:
+            return "출전 기회: 정보 없음"
+        if number >= 0.7:
+            return "출전 기회: 높음 — 경기 경험을 통해 빠른 성장을 기대할 수 있지만 체력 부담도 커질 수 있습니다."
+        if number >= 0.35:
+            return "출전 기회: 보통 — 훈련과 실전의 균형이 잡힌 환경입니다."
+        return "출전 기회: 낮음 — 실전 경험이 부족해 성장 속도가 제한될 수 있습니다."
+
+    if key == "league_difficulty":
+        mapping = {"low": "낮음 — 적응은 쉽지만 성장 자극이 부족할 수 있습니다.",
+                   "medium": "보통 — 현재 단계에서 안정적으로 성장하기 좋은 환경입니다.",
+                   "high": "높음 — 경쟁 수준이 높아 성장 자극은 크지만 출전 기회가 줄 수 있습니다.",
+                   "elite": "매우 높음 — 상위 환경 도전이 크지만 적응 실패와 벤치 리스크가 큽니다."}
+        return f"리그/팀 수준: {mapping.get(value, '알 수 없음')}"
+
+    if key == "career_choice":
+        mapping = {"stay": "잔류 — 익숙한 환경에서 안정적으로 성장할 수 있습니다.",
+                   "loan": "임대 — 출전 시간을 확보해 단기 성장 가능성을 높일 수 있습니다.",
+                   "transfer": "이적 — 환경 변화가 큰 성장 자극이 되지만 적응 실패 리스크가 있습니다."}
+        return f"커리어 선택: {mapping.get(value, '알 수 없음')}"
+
+    if key == "risk_level":
+        mapping = {"safe": "안정형 — 부상과 실패 가능성을 줄이는 대신 성장 속도는 완만할 수 있습니다.",
+                   "normal": "균형형 — 성장과 리스크를 적절히 조절하는 선택입니다.",
+                   "aggressive": "공격형 — 높은 성장 가능성을 노리지만 부상이나 적응 실패 위험이 커집니다."}
+        return f"리스크 성향: {mapping.get(value, '알 수 없음')}"
+
+    return f"{key}: {value}"
+
+
+def manual_similarity_candidates(manual_player, manual_attributes, limit=5):
+    try:
+        profiles = query_df("""
+            select profile_id, player_id, name, age, club, nationality, position, attributes_jsonb, mentality_jsonb
+            from player_profiles
+            where attributes_jsonb is not null
+            limit 200
+        """, ())
+    except Exception:
+        return []
+
+    mapping = {
+        "speed": ["Acc", "Pac", "Agi"],
+        "dribble": ["Dri", "Tec", "Fir"],
+        "finishing": ["Fin", "Cmp", "OtB"],
+        "passing": ["Pas", "Vis", "Dec"],
+        "physical": ["Str", "Sta", "Bal", "Jum"],
+        "defending": ["Tck", "Mar", "Pos"],
+        "work_rate": ["Wor", "Sta"],
+        "teamwork": ["Tea"],
+        "determination": ["Det"],
+        "pressing": ["Pres", "Cmp"],
+    }
+
+    manual_position = (manual_player.get("position") or "").lower()
+    candidates = []
+
+    for _, row in profiles.iterrows():
+        attrs = parse_json_field(row.get("attributes_jsonb")) or {}
+        score = 0.0
+        common_terms = []
+        diff_terms = []
+        count = 0
+
+        for label, keys in mapping.items():
+            manual_value = safe_float(manual_attributes.get(label), 0)
+            values = [numeric_attr(attrs, key) for key in keys]
+            values = [value for value in values if value is not None]
+            if not values:
+                continue
+            avg_candidate = sum(values) / len(values)
+            diff = abs((manual_value * 2.0) - avg_candidate)
+            score += max(0.0, 100.0 - diff * 6.0)
+            count += 1
+            if diff <= 2.5:
+                common_terms.append(attr_label(keys[0], with_code=False))
+            else:
+                diff_terms.append(attr_label(keys[0], with_code=False))
+
+        if count == 0:
+            continue
+
+        score = score / count
+        if manual_position and str(row.get("position") or "").lower():
+            if manual_position in str(row.get("position") or "").lower() or str(row.get("position") or "").lower() in manual_position:
+                score += 6
+        if safe_float(manual_attributes.get("growth_potential"), 0) >= 7:
+            score += 2
+
+        score = min(99.9, max(0.0, score))
+        candidates.append({
+            "profile_id": row.get("profile_id"),
+            "player_id": row.get("player_id"),
+            "name": row.get("name") or "-",
+            "age": row.get("age"),
+            "club": row.get("club") or "-",
+            "position": row.get("position") or "-",
+            "nationality": row.get("nationality") or "-",
+            "similarity": round(score, 1),
+            "common_strengths": ", ".join(common_terms[:3]) or "전반적 스타일 유사성",
+            "difference_hint": ", ".join(diff_terms[:3]) or "세부 차이가 제한적입니다.",
+            "profile": row,
+        })
+
+    candidates = sorted(candidates, key=lambda item: item["similarity"], reverse=True)
+    return candidates[:limit]
+
+
+def note_display_title(note):
+    env = parse_json_field(note.get("env_settings")) if note is not None else {}
+    if isinstance(env, dict):
+        manual_player = env.get("manual_player") if isinstance(env.get("manual_player"), dict) else {}
+        manual_name = safe_text(manual_player.get("name"), None)
+        if manual_name:
+            return manual_name
+
+        player_name = safe_text(env.get("player_name"), None)
+        if player_name:
+            return player_name
+
+    db_name = safe_text(note.get("player_name"), None) if note is not None else None
+    if db_name:
+        return db_name
+
+    selected_name = safe_text(st.session_state.get("selected_player_name"), None)
+    if selected_name:
+        return selected_name
+
+    return "이름 없는 직접 입력 노트"
+
+
+def build_manual_analysis(manual_player, manual_attributes, env_settings, simulation_result):
+    manual_position = safe_text(manual_player.get("position"), "포지션 미입력")
+    manual_name = safe_text(manual_player.get("name"), "이름 없는 직접 입력 노트")
+    manual_age = manual_player.get("age") or "-"
+    manual_club = safe_text(manual_player.get("club"), "소속팀 미입력")
+    manual_nationality = safe_text(manual_player.get("nationality"), "국적 미입력")
+
+    attr_scores = {
+        "속도/기동성": safe_float(manual_attributes.get("speed"), 0),
+        "드리블": safe_float(manual_attributes.get("dribble"), 0),
+        "결정력": safe_float(manual_attributes.get("finishing"), 0),
+        "패스/시야": safe_float(manual_attributes.get("passing"), 0),
+        "피지컬": safe_float(manual_attributes.get("physical"), 0),
+        "수비력": safe_float(manual_attributes.get("defending"), 0),
+        "활동량": safe_float(manual_attributes.get("work_rate"), 0),
+        "팀워크": safe_float(manual_attributes.get("teamwork"), 0),
+        "의지력": safe_float(manual_attributes.get("determination"), 0),
+        "압박 대처": safe_float(manual_attributes.get("pressing"), 0),
+        "성장 잠재력": safe_float(manual_attributes.get("growth_potential"), 0),
+    }
+
+    strengths = sorted(attr_scores.items(), key=lambda item: item[1], reverse=True)[:3]
+    weaknesses = sorted(attr_scores.items(), key=lambda item: item[1])[:2]
+    strength_names = ", ".join([name for name, _ in strengths]) or "강점 데이터 부족"
+    weakness_names = ", ".join([name for name, _ in weaknesses]) or "보완 데이터 부족"
+
+    position_hint = position_training_hint(manual_position, weakness_names)
+    training_recommendations = [
+        "3개월: 가장 시급한 약점인 " + weakness_names + "을 중심으로 반복적인 훈련을 설계합니다.",
+        "6개월: " + manual_position + " 역할에 꼭 필요한 핵심 능력인 " + strength_names + "을 강화해 실제 경기 적용력과 전술 적응력을 끌어올립니다.",
+        "1년: 성장 잠재력과 실행력의 균형을 맞추며, 강점을 확장하는 동시에 약점을 보완하는 로드맵을 진행합니다.",
+    ]
+
+    risk_factors = []
+    if safe_float(env_settings.get("training_intensity"), 0) >= 1.4:
+        risk_factors.append("훈련 강도가 높아 피로 누적과 부상 위험이 커질 수 있습니다.")
+    if str(env_settings.get("league_difficulty", "")).lower() in ("high", "elite"):
+        risk_factors.append("리그 난이도가 높아 적응 부담과 출전 기회 변수에 민감할 수 있습니다.")
+    if str(env_settings.get("risk_level", "")).lower() == "aggressive":
+        risk_factors.append("공격형 리스크 성향은 성장 기회는 크지만 적응 실패 가능성도 함께 증가합니다.")
+
+    career_advice = "현재 입력값 기준으로는 " + readable_setting("career_choice", env_settings.get("career_choice")) + "이 가장 적절한 선택지입니다. "
+    if env_settings.get("career_choice") == "loan":
+        career_advice += "출전 시간이 부족하다면 한 시즌 임대가 성장 속도를 높일 수 있습니다."
+    elif env_settings.get("career_choice") == "transfer":
+        career_advice += "환경 변화는 성장 자극이 크지만, 현재 피지컬/압박 대처가 낮다면 리스크를 먼저 점검해야 합니다."
+    else:
+        career_advice += "안정적인 환경에서 현재 강점을 유지하며 성장하는 것이 우선입니다."
+
+    overall = (
+        f"{manual_name}은(는) 나이 {manual_age}세, {manual_position}, {manual_club} 소속으로 보이며, "
+        f"{strength_names}이 핵심 강점으로 보입니다. 현재 입력값과 시뮬레이션 결과를 종합하면, "
+        f"성장 잠재력 {safe_float(manual_attributes.get('growth_potential'), 0)}/10 수준에서 {manual_nationality}의 환경 속에서 안정적인 성장을 기대할 수 있습니다."
+    )
+
+    mentor_candidates = manual_similarity_candidates(manual_player, manual_attributes, limit=5)
+    mentor_guide = "이 선수는 현재 입력값 기준으로 멘토 후보와의 공통 강점을 바탕으로 성장 루트를 설계할 수 있습니다. " + position_hint
+
+    return {
+        "overall_summary": overall,
+        "strengths": strengths,
+        "weaknesses": weaknesses,
+        "strength_names": strength_names,
+        "weakness_names": weakness_names,
+        "training_recommendations": training_recommendations,
+        "career_advice": career_advice,
+        "risk_factors": risk_factors,
+        "mentor_candidates": mentor_candidates,
+        "mentor_guide": mentor_guide,
+        "simulation_result": simulation_result,
+        "env_settings": env_settings,
+        "manual_player": manual_player,
+        "manual_attributes": manual_attributes,
+    }
+
+
 def render_my_notes():
-    st.title("내 스카우팅 노트")
-    st.info("현재는 Supabase Auth와 RLS가 연결되지 않은 프로토타입 단계이므로 사용자별 필터링은 적용되지 않습니다. 향후 user_id 기반으로 본인의 노트만 조회하도록 확장할 예정입니다.")
+    st.title("My Scouting Notes")
+    st.info(
+        "이 화면은 직접 입력한 유망주 분석, 멘토 추천, 성장 가이드, 저장된 노트를 함께 보는 프로토타입 화면입니다. "
+        "실제 Gemini API 호출은 없으며, FM 기반 proxy 능력치와 직접 입력값을 연결해 템플릿 기반 분석을 생성합니다."
+    )
+
+    st.subheader("직접 입력 유망주 분석 (prototype)")
+    st.caption("선수 이름, 능력치, 메모를 입력하면 성장 잠재력, 강점/보완점, 훈련 방향, 멘토 후보, 멘토 기반 성장 가이드를 미리 확인할 수 있습니다.")
+
+    with st.form("custom_note_form"):
+        c1, c2 = st.columns(2)
+        with c1:
+            custom_name = st.text_input("유망주 이름", placeholder="예: Custom Prospect A")
+            custom_age = st.number_input("나이", min_value=14, max_value=35, value=18, step=1)
+            custom_position = st.text_input("포지션", placeholder="예: ST / CM / LB")
+            custom_sub_position = st.text_input("세부 포지션", placeholder="예: CF / CM")
+            custom_club = st.text_input("소속팀 / 학교", placeholder="예: Academy FC")
+            custom_nationality = st.text_input("국적", placeholder="예: Korea")
+            custom_foot = st.text_input("주발", placeholder="예: 오른발")
+        with c2:
+            custom_height = st.text_input("키(cm)", placeholder="예: 182")
+            custom_note = st.text_area("관찰 메모", placeholder="예: 속도와 돌파는 좋지만 마무리와 수비 전개를 보완할 필요가 있음")
+            speed = st.slider("속도/기동성", 1, 10, 7)
+            dribble = st.slider("드리블", 1, 10, 6)
+            finishing = st.slider("결정력", 1, 10, 5)
+            passing = st.slider("패스/시야", 1, 10, 6)
+            physical = st.slider("피지컬", 1, 10, 6)
+            defending = st.slider("수비력", 1, 10, 5)
+            work_rate = st.slider("활동량", 1, 10, 7)
+            teamwork = st.slider("팀워크", 1, 10, 7)
+            determination = st.slider("의지력", 1, 10, 7)
+            pressing = st.slider("압박 대처", 1, 10, 5)
+            growth_potential = st.slider("성장 잠재력", 1, 10, 8)
+
+        training_intensity = st.slider("훈련 강도", 0.5, 2.0, 1.2, 0.1)
+        playing_time = st.slider("출전 기회", 0.0, 1.0, 0.6, 0.05)
+        league_difficulty = st.selectbox("리그/팀 수준", ["low", "medium", "high", "elite"], index=1, format_func=lambda value: readable_setting("league_difficulty", value))
+        career_choice = st.radio("커리어 선택", ["stay", "loan", "transfer"], horizontal=True, format_func=lambda value: readable_setting("career_choice", value))
+        risk_level = st.radio("리스크 성향", ["safe", "normal", "aggressive"], horizontal=True, index=1, format_func=lambda value: readable_setting("risk_level", value))
+
+        submitted = st.form_submit_button("프로토타입 분석 생성")
+
+    if submitted:
+        env_settings = {
+            "note_type": "manual_custom_prospect",
+            "manual_player": {
+                "name": custom_name,
+                "age": int(custom_age),
+                "position": custom_position,
+                "sub_position": custom_sub_position,
+                "club": custom_club,
+                "nationality": custom_nationality,
+                "foot": custom_foot,
+                "height": custom_height,
+                "observation_note": custom_note,
+            },
+            "manual_attributes": {
+                "speed": float(speed),
+                "dribble": float(dribble),
+                "finishing": float(finishing),
+                "passing": float(passing),
+                "physical": float(physical),
+                "defending": float(defending),
+                "work_rate": float(work_rate),
+                "teamwork": float(teamwork),
+                "determination": float(determination),
+                "pressing": float(pressing),
+                "growth_potential": float(growth_potential),
+            },
+            "career_settings": {
+                "training_intensity": float(training_intensity),
+                "playing_time_opportunity": float(playing_time),
+                "league_difficulty": league_difficulty,
+                "career_choice": career_choice,
+                "risk_level": risk_level,
+            },
+            "selected_mentor_profile_id": st.session_state.get("manual_selected_mentor_profile_id"),
+            "selected_mentor_name": st.session_state.get("manual_selected_mentor_name"),
+        }
+        simulation_result = build_simulation_result(env_settings["career_settings"])
+        analysis = build_manual_analysis(env_settings["manual_player"], env_settings["manual_attributes"], env_settings["career_settings"], simulation_result)
+        simulation_result.update({
+            "prototype_growth_score": simulation_result.get("prototype_growth_score"),
+            "prototype_success_probability": simulation_result.get("prototype_success_probability"),
+            "prototype_injury_risk": simulation_result.get("prototype_injury_risk"),
+            "strengths": [name for name, _ in analysis["strengths"]],
+            "weaknesses": [name for name, _ in analysis["weaknesses"]],
+            "training_recommendations": analysis["training_recommendations"],
+            "career_advice": analysis["career_advice"],
+            "risk_factors": analysis["risk_factors"],
+            "mentor_guide": analysis["mentor_guide"],
+            "overall_summary": analysis["overall_summary"],
+        })
+
+        report_text = "\n\n".join([
+            "AI 스카우팅 리포트 초안 (프로토타입)",
+            f"종합 평가\n{analysis['overall_summary']}",
+            "핵심 강점\n" + "; ".join([f"{name}({score}/10)" for name, score in analysis['strengths']]),
+            "보완점\n" + "; ".join([f"{name}({score}/10)" for name, score in analysis['weaknesses']]),
+            "추천 훈련 방향\n" + "\n".join(analysis['training_recommendations']),
+            "멘토 기반 성장 가이드\n" + analysis['mentor_guide'],
+            "커리어 선택 조언\n" + analysis['career_advice'],
+            "장점과 리스크\n" + "\n".join(analysis['risk_factors'] or ["현재 입력값 기준 리스크는 아직 명확하지 않습니다."]),
+            "예상 성장 방향\n" + "이 분석은 실제 예측 모델이 아니라 FM 기반 proxy 능력치와 직접 입력값으로 만든 템플릿 기반 가이드입니다.",
+        ])
+
+        st.session_state["custom_note_preview"] = {
+            "env_settings": env_settings,
+            "simulation_result": simulation_result,
+            "report": report_text,
+            "analysis": analysis,
+            "player_name": custom_name,
+        }
+        st.session_state["manual_analysis_result"] = analysis
+        st.session_state["manual_report_text"] = report_text
+
+    preview = st.session_state.get("custom_note_preview")
+    if preview:
+        st.subheader("생성된 프로토타입 분석 미리보기")
+        analysis = preview.get("analysis") or {}
+        env_settings = normalize_env_settings(preview.get("env_settings"))
+        career_settings = get_career_settings(env_settings)
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("성장 점수", preview["simulation_result"].get("prototype_growth_score", "-"))
+        c2.metric("성공 가능성", format_percent(preview["simulation_result"].get("prototype_success_probability")))
+        c3.metric("부상 리스크", format_percent(preview["simulation_result"].get("prototype_injury_risk")))
+
+        st.markdown(f"<div class='scout-panel'><b>종합 평가</b><br>{analysis.get('overall_summary', '')}</div>", unsafe_allow_html=True)
+
+        st.markdown(
+            "<div class='scout-panel'>" +
+            "<b>환경 요약</b><br>" +
+            "<br>".join([
+                setting_summary('training_intensity', career_settings.get('training_intensity')),
+                setting_summary('playing_time_opportunity', career_settings.get('playing_time_opportunity')),
+                setting_summary('league_difficulty', career_settings.get('league_difficulty')),
+                setting_summary('career_choice', career_settings.get('career_choice')),
+                setting_summary('risk_level', career_settings.get('risk_level')),
+            ]) +
+            "</div>",
+            unsafe_allow_html=True,
+        )
+
+        cols = st.columns(2)
+        with cols[0]:
+            st.markdown("<div class='scout-panel'><b>핵심 강점</b><br>" + "<br>".join([f"• {name}: {score}/10" for name, score in analysis.get('strengths', [])]) + "</div>", unsafe_allow_html=True)
+            st.markdown("<div class='scout-panel'><b>보완점</b><br>" + "<br>".join([f"• {name}: {score}/10" for name, score in analysis.get('weaknesses', [])]) + "</div>", unsafe_allow_html=True)
+        with cols[1]:
+            st.markdown("<div class='scout-panel'><b>추천 훈련 방향</b><br>" + "<br>".join([f"• {item}" for item in analysis.get('training_recommendations', [])]) + "</div>", unsafe_allow_html=True)
+            st.markdown("<div class='scout-panel'><b>커리어 선택 조언</b><br>" + analysis.get('career_advice', '') + "</div>", unsafe_allow_html=True)
+
+        st.subheader("유사 멘토 후보")
+        mentor_candidates = analysis.get("mentor_candidates", [])
+        if mentor_candidates:
+            for mentor in mentor_candidates:
+                st.markdown(
+                    f"""
+                    <div class="scout-panel">
+                        <h3 style="margin-top:0;">{mentor['name']}</h3>
+                        <div class="badge-row">
+                            <span class="scout-badge">나이 {mentor.get('age') or '-'}</span>
+                            <span class="scout-badge">{mentor.get('position') or '-'}</span>
+                            <span class="scout-badge">{mentor.get('club') or '-'}</span>
+                            <span class="scout-badge">유사도 {mentor.get('similarity', '-')}</span>
+                        </div>
+                        <p><b>공통 강점</b><br>{mentor.get('common_strengths', '-')}</p>
+                        <p><b>주요 차이점</b><br>{mentor.get('difference_hint', '-')}</p>
+                        <p>이 멘토 후보는 직접 입력 능력치와 FM proxy 능력치를 비교했을 때 참고하기 좋은 형태의 프로토타입 추천입니다.</p>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+                if st.button("이 멘토 선택", key=f"manual_mentor_{mentor['profile_id']}", type="secondary"):
+                    st.session_state["manual_selected_mentor_profile_id"] = mentor['profile_id']
+                    st.session_state["manual_selected_mentor_name"] = mentor['name']
+                    st.session_state["manual_mentor_summary"] = (
+                        f"{mentor['name']}은(는) 현재 직접 입력 능력치와 유사한 강점을 보이는 후보입니다. "
+                        f"공통 강점: {mentor['common_strengths']} / 차이점: {mentor['difference_hint']}"
+                    )
+                    st.success(f"{mentor['name']}을(를) 멘토 후보로 선택했습니다.")
+        else:
+            st.info("현재 입력값 기준으로 멘토 후보를 생성할 수 없었습니다. 프로필 속성 데이터가 없는 경우에는 기본 가이드만 표시됩니다.")
+
+        mentor_name = st.session_state.get("manual_selected_mentor_name")
+        mentor_summary = st.session_state.get("manual_mentor_summary")
+        if mentor_name:
+            st.markdown(
+                f"<div class='scout-panel'><b>멘토 기반 성장 가이드</b><br>선택된 멘토: {mentor_name}<br>{mentor_summary or '선택한 멘토의 성장 가이드를 반영했습니다.'}</div>",
+                unsafe_allow_html=True,
+            )
+
+        st.markdown("<div class='scout-panel'><b>장점과 리스크</b><br>" + "<br>".join(analysis.get('risk_factors', []) or ["현재 입력값 기준 리스크는 아직 충분하지 않습니다."]) + "</div>", unsafe_allow_html=True)
+
+        if st.button("이 노트를 scouting_notes에 저장", type="primary"):
+            try:
+                saved = insert_scouting_note(
+                    player_id=None,
+                    profile_id=None,
+                    env_settings=normalize_env_settings(preview.get("env_settings")),
+                    simulation_result=preview["simulation_result"],
+                    report=preview["report"],
+                )
+                st.success(f"직접 입력 노트가 저장되었습니다. note_id: {saved['note_id']}")
+            except Exception as exc:
+                st.error("직접 입력 노트 저장 중 오류가 발생했습니다.")
+                with st.expander("개발 확인용 오류"):
+                    st.exception(exc)
+
+        with st.expander("개발자용 원본 JSON 보기"):
+            st.json({"env_settings": preview.get("env_settings"), "simulation_result": preview.get("simulation_result"), "report": preview.get("report")})
+
+        render_page_actions([
+            ("🔎 새 유망주 검색", "유망주 검색", "primary"),
+            ("📝 새 유망주 직접 입력", "내 스카우팅 노트"),
+        ], title="저장 완료 · 다음 단계")
+
+    st.divider()
+    st.subheader("저장된 노트 조회")
     try:
         notes = get_scouting_notes(limit=20)
     except Exception as exc:
@@ -3209,136 +4380,181 @@ def render_my_notes():
         with st.expander("개발 확인용 오류"):
             st.exception(exc)
         return
+
     if notes.empty:
-        st.info("저장된 스카우팅 노트가 없습니다.")
+        st.info("현재 저장된 노트가 없습니다. 위에서 직접 입력한 커스텀 노트나 기존 저장 리포트를 확인할 수 있습니다.")
+        render_page_actions([
+            ("🔎 유망주 검색으로 이동", "유망주 검색", "primary"),
+            ("📝 새 유망주 직접 입력", "내 스카우팅 노트"),
+        ])
         return
+
     for _, note in notes.iterrows():
-        preview = (note.get("gemini_report") or "").splitlines()
-        preview_text = preview[2] if len(preview) > 2 else (note.get("gemini_report") or "")[:160]
+        env = parse_json_field(note.get("env_settings")) or {}
+        sim = parse_json_field(note.get("simulation_result")) or {}
+        manual_player = env.get("manual_player") if isinstance(env, dict) and isinstance(env.get("manual_player"), dict) else {}
+        legacy_player = env.get("player") if isinstance(env, dict) and isinstance(env.get("player"), dict) else {}
+        player_snapshot = manual_player or legacy_player
+        if not player_snapshot and note.get("player_name"):
+            player_snapshot = {
+                "name": safe_text(note.get("player_name"), "이름 없는 노트"),
+                "age": env.get("age"),
+                "position": env.get("position"),
+                "club": env.get("club"),
+                "nationality": env.get("nationality"),
+            }
+        title = note_display_title(note)
+        summary = safe_text(sim.get("overall_summary"), note_summary_text(note))
+        strengths = sim.get("strengths") if isinstance(sim, dict) else []
+        weaknesses = sim.get("weaknesses") if isinstance(sim, dict) else []
+        mentor_name = env.get("selected_mentor_name") or "선택된 멘토 없음"
+        growth_score = sim.get("prototype_growth_score", "-")
+        injury_risk = sim.get("prototype_injury_risk")
+        preview_text = safe_text(note.get("gemini_report"), "")
+
         st.markdown(
             f"""
             <div class="scout-panel">
-                <h3 style="margin-top:0;">{note.get('player_name') or note.get('player_id')}</h3>
+                <h3 style="margin-top:0;">{title}</h3>
                 <div class="muted">저장일 {note.get('created_at')}</div>
-                <p><b>시뮬레이션 요약</b><br>{note_summary_text(note)}</p>
-                <p><b>리포트 요약</b><br>{preview_text}</p>
+                <p><b>나이 / 포지션 / 소속팀 / 국적</b><br>
+                {safe_text(player_snapshot.get('age'), '-') if isinstance(player_snapshot, dict) else '-'}세 ·
+                {safe_text(player_snapshot.get('position'), '-') if isinstance(player_snapshot, dict) else '-'} ·
+                {safe_text(player_snapshot.get('club'), '-') if isinstance(player_snapshot, dict) else '-'} ·
+                {safe_text(player_snapshot.get('nationality'), '-') if isinstance(player_snapshot, dict) else '-'}
+                </p>
+                <p><b>종합 평가 요약</b><br>{summary}</p>
+                <p><b>핵심 강점</b><br>{' · '.join(str(item) for item in strengths[:3]) if strengths else '정보 없음'}</p>
+                <p><b>보완점</b><br>{' · '.join(str(item) for item in weaknesses[:2]) if weaknesses else '정보 없음'}</p>
+                <p><b>선택한 멘토</b><br>{mentor_name}</p>
+                <p><b>성장 가능성 / 부상 리스크</b><br>{growth_score} / {format_percent(injury_risk)}</p>
             </div>
             """,
             unsafe_allow_html=True,
         )
         with st.expander("상세 보기"):
-            st.text(note.get("gemini_report") or "")
+            st.write("### 종합 평가")
+            st.write(summary)
+            if strengths:
+                st.write("### 핵심 강점")
+                for item in strengths:
+                    st.write("- " + str(item))
+            if weaknesses:
+                st.write("### 보완점")
+                for item in weaknesses:
+                    st.write("- " + str(item))
+            if env.get("selected_mentor_name"):
+                st.write("### 선택한 멘토")
+                st.write(env["selected_mentor_name"])
+            if preview_text:
+                st.write("### 리포트 요약")
+                st.text(preview_text[:500])
+        with st.expander("개발자용 원본 JSON 보기"):
+            st.json({"env_settings": env, "simulation_result": sim, "gemini_report": note.get("gemini_report")})
+
+    render_page_actions([
+        ("🔎 새 유망주 검색", "유망주 검색", "primary"),
+        ("📝 새 유망주 직접 입력", "내 스카우팅 노트"),
+    ], title="다음 작업")
 
 
 def render_home():
-    st.title("NEXT-LEGEND FINDER")
-    st.caption("축구 유망주를 위한 스카우팅 리포트형 데이터베이스 서비스 프로토타입")
-    st.markdown(
-        """
-        <div class="scout-panel">
-            <h3 style="margin-top:0;">서비스 개요</h3>
-            NEXT-LEGEND FINDER는 유망주 검색, 통합 분석, 유사 선수 후보, 커리어 시뮬레이션,
-            스카우팅 리포트 저장 흐름을 하나로 묶은 HW#5 프로토타입입니다.
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    c1, c2, c3 = st.columns(3)
-    c1.metric("데이터베이스", "Supabase")
-    c2.metric("스타일 분석", "24차원 proxy")
-    c3.metric("리포트", "템플릿 초안")
-    st.info("공식 Football Manager 로고나 자산을 복제하지 않고, 축구 스카우팅 화면의 정보 구조에서만 영감을 받았습니다.")
+    status = get_selected_player_status()
+    feature_cards = [
+        {
+            "title": "유망주 검색",
+            "description": "DB에서 분석할 유망주를 검색하고 선택합니다.",
+            "button_label": "유망주 찾기",
+            "nav_target": "유망주 검색",
+        },
+        {
+            "title": "통합 분석 대시보드",
+            "description": "선택한 선수의 기본 정보, 능력치, 시장가치, 출전 기록을 확인합니다.",
+            "button_label": "선수 분석 보기",
+            "nav_target": "유망주 통합 분석",
+        },
+        {
+            "title": "유사 선수 / 멘토 매칭",
+            "description": "FM 기반 proxy 벡터와 능력치 비교로 유사 후보를 확인합니다.",
+            "button_label": "유사 멘토 찾기",
+            "nav_target": "유사 선수 후보",
+        },
+        {
+            "title": "커리어 시뮬레이션",
+            "description": "훈련 강도, 출전 기회, 리그 수준에 따른 성장 시나리오를 확인합니다.",
+            "button_label": "시뮬레이션 시작",
+            "nav_target": "커리어 시뮬레이션",
+        },
+        {
+            "title": "AI 스카우팅 리포트",
+            "description": "템플릿 기반 스카우팅 리포트 초안을 생성합니다.",
+            "button_label": "리포트 생성",
+            "nav_target": "AI 스카우팅 리포트",
+        },
+        {
+            "title": "내 스카우팅 노트",
+            "description": "직접 입력 유망주 분석, 멘토 추천, 저장된 노트를 확인합니다.",
+            "button_label": "노트 작성/조회",
+            "nav_target": "내 스카우팅 노트",
+        },
+        {
+            "title": "DB 상태 확인",
+            "description": "Supabase 연결과 데이터 상태를 확인합니다.",
+            "button_label": "DB 상태 보기",
+            "nav_target": "DB 상태 확인",
+        },
+    ]
+    render_home_view(status, feature_cards)
 
 
 def render_prospect_search():
-    st.title("유망주 검색")
-    st.caption("분석할 유망주를 검색하고 선택합니다. 선택한 선수는 다른 화면에서 공통으로 사용됩니다.")
-    st.info("유망주 기준: FM 데이터 기준 만 23세 이하")
-    max_age = st.slider("최대 나이", min_value=16, max_value=30, value=23, step=1)
-    try:
-        positions = get_distinct_positions(max_age=max_age)
-    except Exception:
-        positions = ["All"]
-    c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
-    with c1:
-        keyword = st.text_input("선수 이름", placeholder="예: Bellingham, Yamal, Son")
-    with c2:
-        position = st.selectbox("포지션", positions)
-    with c3:
-        nationality = st.text_input("국적", placeholder="예: Korea")
-    with c4:
-        club = st.text_input("소속팀", placeholder="예: Dortmund")
-    try:
-        results = search_players(keyword, position, nationality, club, max_age=max_age)
-    except Exception as exc:
-        st.error("선수 검색 중 오류가 발생했습니다.")
-        with st.expander("개발 확인용 오류"):
-            st.exception(exc)
-        return
-    if results.empty:
-        st.info("검색 결과가 없습니다. 현재 검색은 player_profiles.age가 있는 선수만 대상으로 합니다.")
-        return
-    display = results[["player_id", "name", "age", "current_club_name", "country_of_citizenship", "position", "sub_position", "market_value_in_eur"]].rename(
-        columns={
-            "player_id": "선수 ID",
-            "name": "선수명",
-            "age": "나이",
-            "current_club_name": "소속팀",
-            "country_of_citizenship": "국적",
-            "position": "포지션",
-            "sub_position": "세부 포지션",
-            "market_value_in_eur": "현재 시장가치",
-        }
-    )
-    st.dataframe(display, use_container_width=True, hide_index=True)
-    labels = {
-        f"{row['name']} | 나이 {row.get('age') or '-'} | {row.get('current_club_name') or '-'} | ID {row['player_id']}": int(row["player_id"])
-        for _, row in results.iterrows()
-    }
-    selected_label = st.selectbox("분석할 선수 선택", list(labels.keys()))
-    if st.button("선택한 선수 저장", type="primary"):
-        st.session_state["selected_player_id"] = labels[selected_label]
-        st.success("선택한 선수를 저장했습니다.")
-    show_selected_player_banner()
+    render_prospect_search_view()
 
 
 def render_db_status():
-    st.title("DB 상태 확인")
-    try:
-        st.success("Supabase 연결 성공")
-        st.dataframe(pd.DataFrame([{"테이블": table, "행 수": table_count(table)} for table in TABLES]), use_container_width=True, hide_index=True)
-    except Exception as exc:
-        st.error("Supabase 연결 또는 테이블 조회 중 오류가 발생했습니다.")
-        with st.expander("개발 확인용 오류"):
-            st.exception(exc)
-        return
-    table_name = st.selectbox("미리 볼 테이블", TABLES)
-    limit = st.slider("조회 행 수", 5, 100, 30, 5)
-    try:
-        st.dataframe(preview_table(table_name, limit=limit), use_container_width=True, hide_index=True)
-    except Exception as exc:
-        st.error("테이블 미리보기 중 오류가 발생했습니다.")
-        with st.expander("개발 확인용 오류"):
-            st.exception(exc)
+    render_db_status_view()
 
 
 def main():
-    apply_theme()
-    st.sidebar.title("NEXT-LEGEND FINDER")
-    menu = {
-        "홈 / 서비스 소개": render_home,
-        "유망주 검색": render_prospect_search,
-        "유망주 통합 분석": render_dashboard,
-        "유사 선수 후보": render_legend_matching,
-        "커리어 시뮬레이션": render_career_simulation,
-        "AI 스카우팅 리포트": render_ai_report,
-        "내 스카우팅 노트": render_my_notes,
-        "DB 상태 확인": render_db_status,
-    }
-    page = st.sidebar.radio("메뉴", list(menu.keys()))
-    st.sidebar.divider()
-    show_selected_player_banner()
-    menu[page]()
+    apply_ui_theme()
+    init_navigation_state()
+    render_app_header()
+
+    page = st.session_state.get("current_page", "home")
+
+    if page == "home":
+        render_home_view()
+    elif page == "prospect_search":
+        render_prospect_search_view()
+    elif page == "dashboard":
+        render_dashboard()
+    elif page == "legend_matching":
+        render_legend_matching()
+    elif page == "career_simulation":
+        render_career_simulation()
+    elif page == "ai_report":
+        render_ai_report()
+    elif page == "scouting_notes":
+        render_my_notes()
+    elif page == "db_status":
+        render_db_status_view()
+    else:
+        render_home_view()
+
+    st.divider()
+    nav_cols = st.columns(4)
+    with nav_cols[0]:
+        if st.button("🏠 홈으로", use_container_width=True):
+            navigate_to("home")
+    with nav_cols[1]:
+        if st.button("🔎 유망주 찾기", use_container_width=True):
+            navigate_to("prospect_search")
+    with nav_cols[2]:
+        if st.button("📊 분석 보기", use_container_width=True):
+            navigate_to("dashboard")
+    with nav_cols[3]:
+        if st.button("🗂️ DB 상태", use_container_width=True):
+            navigate_to("db_status")
 
 
 def render_prospect_search():
@@ -3347,6 +4563,10 @@ def render_prospect_search():
     selected_name = st.session_state.get("selected_player_name")
     if selected_name:
         st.success(f"현재 선택된 선수: {selected_name}")
+        render_page_actions([
+            ("📊 통합 분석으로 이동", "유망주 통합 분석", "primary"),
+            ("🤝 유사 멘토 찾기", "유사 선수 후보"),
+        ], title="선수 선택 완료 · 다음 단계")
     else:
         show_selected_player_banner()
 
@@ -3368,7 +4588,8 @@ def render_prospect_search():
     with c3:
         try:
             positions = get_distinct_positions(max_age=max_age)
-        except Exception:
+        except Exception as exc:
+            show_db_error("포지션 목록 조회", exc)
             positions = ["All"]
         position = st.selectbox("포지션", positions)
 
@@ -3398,9 +4619,7 @@ def render_prospect_search():
             st.session_state["prospect_results"] = results
             st.session_state["last_search_filters"] = filters
         except Exception as exc:
-            st.error("유망주 검색 중 오류가 발생했습니다.")
-            with st.expander("개발 확인용 오류"):
-                st.exception(exc)
+            show_db_error("유망주 검색", exc)
             return
 
     if "prospect_results" not in st.session_state:
@@ -3441,8 +4660,23 @@ def render_prospect_search():
             unsafe_allow_html=True,
         )
         if st.button("이 선수 선택", key=f"select_prospect_{player_id}"):
+            previous_player_id = st.session_state.get("selected_player_id")
             st.session_state["selected_player_id"] = player_id
             st.session_state["selected_player_name"] = row.get("name")
+            if previous_player_id != player_id:
+                for key in [
+                    "selected_mentor_profile_id",
+                    "selected_mentor_name",
+                    "mentor_summary",
+                    "env_settings",
+                    "simulation_result",
+                    "generated_report_sections",
+                    "generated_report",
+                    "selected_profile_id",
+                    "selected_profile_fallback_note",
+                    "selected_entity_type",
+                ]:
+                    st.session_state.pop(key, None)
             st.success("선수가 선택되었습니다. 유망주 통합 분석 화면에서 확인할 수 있습니다.")
             st.info("왼쪽 메뉴에서 '유망주 통합 분석'으로 이동하세요.")
 
@@ -3450,6 +4684,7 @@ def render_prospect_search():
 def main():
     apply_theme()
     st.sidebar.title("NEXT-LEGEND FINDER")
+    st.sidebar.caption("보조 메뉴 · 메인 이동은 상단 navigation chip과 화면 안의 버튼을 이용하세요.")
     menu = {
         "홈 / 서비스 소개": render_home,
         "유망주 검색": render_prospect_search,
@@ -3460,9 +4695,11 @@ def main():
         "내 스카우팅 노트": render_my_notes,
         "DB 상태 확인": render_db_status,
     }
-    page = st.sidebar.radio("메뉴", list(menu.keys()))
+    if "nav_page_request" in st.session_state:
+        st.session_state["nav_page"] = st.session_state.pop("nav_page_request")
+    page = st.sidebar.radio("메뉴", list(menu.keys()), key="nav_page")
     st.sidebar.divider()
-    show_selected_player_banner()
+    render_app_header(page)
     menu[page]()
 
 
@@ -3504,32 +4741,34 @@ def readable_setting(key, value):
     return maps.get(key, {}).get(value, "알 수 없음" if value is None else str(value))
 
 
-def compare_attributes(selected_attrs, mentor_attrs):
-    if not isinstance(selected_attrs, dict) or not isinstance(mentor_attrs, dict):
-        return {"common_high": [], "mentor_higher": [], "selected_higher": []}
+def compare_attributes(selected_attrs, candidate_attrs):
+    if not isinstance(selected_attrs, dict) or not isinstance(candidate_attrs, dict):
+        return {"common_high": [], "mentor_higher": [], "candidate_higher": [], "selected_higher": []}
 
-    keys = [key for group in ATTRIBUTE_GROUPS.values() for key in group]
+    known_keys = [key for group in ATTRIBUTE_GROUPS.values() for key in group]
+    keys = list(dict.fromkeys(known_keys + list(selected_attrs) + list(candidate_attrs)))
     common_high = []
-    mentor_higher = []
+    candidate_higher = []
     selected_higher = []
 
     for key in keys:
         selected_value = numeric_attr(selected_attrs, key)
-        mentor_value = numeric_attr(mentor_attrs, key)
-        if selected_value is None or mentor_value is None:
+        candidate_value = numeric_attr(candidate_attrs, key)
+        if selected_value is None or candidate_value is None:
             continue
-        if selected_value >= 12 and mentor_value >= 12:
-            common_high.append((key, round((selected_value + mentor_value) / 2, 1)))
-        diff = mentor_value - selected_value
+        if selected_value >= 12 and candidate_value >= 12:
+            common_high.append((key, round((selected_value + candidate_value) / 2, 1)))
+        diff = candidate_value - selected_value
         if diff >= 2:
-            mentor_higher.append((key, round(diff, 1)))
+            candidate_higher.append((key, round(diff, 1)))
         elif diff <= -2:
             selected_higher.append((key, round(abs(diff), 1)))
 
     return {
         "common_high": sorted(common_high, key=lambda item: item[1], reverse=True)[:3],
-        "mentor_higher": sorted(mentor_higher, key=lambda item: item[1], reverse=True)[:3],
-        "selected_higher": sorted(selected_higher, key=lambda item: item[1], reverse=True)[:3],
+        "mentor_higher": sorted(candidate_higher, key=lambda item: item[1], reverse=True)[:3],
+        "candidate_higher": sorted(candidate_higher, key=lambda item: item[1], reverse=True)[:3],
+        "selected_higher": sorted(selected_higher, key=lambda item: item[1], reverse=True)[:2],
     }
 
 
@@ -3550,8 +4789,50 @@ def position_training_hint(position, improvement_names):
     return f"현재 포지션에서는 {improvement_names}을 중심으로 약점을 보완하고, 이미 높은 강점은 유지하는 방향이 적절합니다."
 
 
+def generate_similarity_reason(selected_player, candidate_player, selected_attrs, candidate_attrs):
+    comparison = compare_attributes(selected_attrs, candidate_attrs)
+    common_names = attr_names(comparison["common_high"])
+    candidate_higher_names = attr_names(comparison["candidate_higher"])
+    selected_higher_names = attr_names(comparison["selected_higher"])
+
+    if common_names:
+        similarity_reason = (
+            f"두 선수는 {common_names}에서 공통으로 높은 수치를 보여 유사한 역할 후보로 해석할 수 있습니다. "
+            "pgvector 유사도는 FM 기반 proxy style_vector(24차원) 전반의 가까움을 함께 반영합니다."
+        )
+        common_strengths = common_names
+    else:
+        similarity_reason = (
+            "공통으로 높게 나타난 세부 능력치는 제한적이지만, FM 기반 proxy style_vector(24차원) "
+            "전반의 거리가 가까워 비교 후보로 제시되었습니다."
+        )
+        common_strengths = "세부 공통 강점 데이터가 부족합니다."
+
+    difference_parts = []
+    if candidate_higher_names:
+        difference_parts.append(f"후보가 앞선 능력치는 {candidate_higher_names}입니다")
+    if selected_higher_names:
+        difference_parts.append(f"선택 선수가 앞선 능력치는 {selected_higher_names}입니다")
+    differences = ". ".join(difference_parts) + "." if difference_parts else "뚜렷한 능력치 차이 데이터가 부족합니다."
+
+    position = selected_player.get("position") or candidate_player.get("position") or "현재 포지션"
+    improvement_names = candidate_higher_names or "세부 능력치"
+    tactical_interpretation = (
+        f"{position} 역할에서 {common_names or '전반적인 스타일'}을 공통 기반으로 활용할 수 있습니다. "
+        f"{position_training_hint(position, improvement_names)}"
+    )
+    return {
+        "comparison": comparison,
+        "common_strengths": common_strengths,
+        "differences": differences,
+        "similarity_reason": similarity_reason,
+        "tactical_interpretation": tactical_interpretation,
+    }
+
+
 def generate_mentor_guide(selected_player, mentor_player, selected_attrs, mentor_attrs, simulation_result=None):
-    comparison = compare_attributes(selected_attrs, mentor_attrs)
+    reason = generate_similarity_reason(selected_player, mentor_player, selected_attrs, mentor_attrs)
+    comparison = reason["comparison"]
     if not comparison["common_high"] and not comparison["mentor_higher"]:
         limited = "현재 후보 선수의 세부 능력치 데이터가 부족하여 상세 멘토링은 제한적으로 제공됩니다."
         return {
@@ -3565,13 +4846,20 @@ def generate_mentor_guide(selected_player, mentor_player, selected_attrs, mentor
     common_names = attr_names(comparison["common_high"]) or "스타일 벡터 전반"
     improvement_names = attr_names(comparison["mentor_higher"]) or "세부 능력치"
     selected_better = attr_names(comparison["selected_higher"]) or "일부 강점"
-    similarity_reason = f"두 선수는 {common_names}에서 공통 강점을 보여 유사한 역할 후보로 볼 수 있습니다. 특히 FM 기반 proxy style_vector가 가까워 전술적 성향을 비교해볼 만합니다."
+    similarity_reason = reason["similarity_reason"]
     improvement_points = f"선택 유망주는 후보 선수와 비교했을 때 {improvement_names}에서 보완 여지가 있습니다. 반대로 {selected_better}에서는 선택 유망주가 이미 경쟁력을 보일 수 있습니다."
-    training_recommendation = position_training_hint(selected_player.get("position"), improvement_names)
+    training_recommendation = reason["tactical_interpretation"]
     career_advice = f"현재 유망주의 시장가치는 {money(selected_player.get('market_value_in_eur'))}입니다. 상위 리그 이적보다 안정적인 출전 시간을 확보할 수 있는 팀에서 성장하는 전략을 우선 검토하는 것이 좋습니다."
     if simulation_result:
         career_advice += f" 현재 시뮬레이션 기준 성공 가능성은 {format_percent(simulation_result.get('prototype_success_probability'))}입니다."
-    mentor_summary = f"멘토 후보 {mentor_player.get('name') or '-'}와 비교하면, 공통 강점은 {common_names}이고 주요 보완 방향은 {improvement_names}입니다. 이 멘토링은 실제 레전드 성장 로그가 아니라 유사 선수 프로필 기반 멘토링 프로토타입입니다."
+    mentor_summary = (
+        f"멘토 후보 {mentor_player.get('name') or '-'} 참고 가이드. "
+        f"유사 후보 이유: {similarity_reason} "
+        f"보완할 점: {improvement_points} "
+        f"추천 훈련: {training_recommendation} "
+        f"커리어 조언: {career_advice} "
+        "이 내용은 실제 레전드 성장 로그가 아니라 FM 기반 proxy 능력치 차이를 활용한 프로토타입 조언입니다."
+    )
     return {
         "similarity_reason": similarity_reason,
         "improvement_points": improvement_points,
@@ -3639,6 +4927,11 @@ def render_career_simulation():
     with st.expander("개발자용 시뮬레이션 원본 데이터 보기"):
         st.json({"env_settings": env_settings, "simulation_result": simulation_result})
 
+    render_page_actions([
+        ("📄 AI 스카우팅 리포트 생성", "AI 스카우팅 리포트", "primary"),
+        ("📝 My Scouting Notes에 저장", "내 스카우팅 노트"),
+    ])
+
 
 def render_mentor_guide(selected_player, selected_profile, mentor_row, mentor_profile):
     selected_attrs = parse_json_field(selected_profile.get("attributes_jsonb")) if selected_profile else {}
@@ -3655,11 +4948,18 @@ def render_legend_matching():
     player = require_selected_player()
     if player is None:
         return
-    profile = get_player_profile(player)
+    ctx = resolve_selected_player_context()
+    profile = selected_profile()
     render_player_profile_panel(player, profile)
     st.info("현재 매칭은 실제 10x10 Grid 데이터가 아니라 FM 기반 proxy style_vector(24차원)를 활용한 pgvector 유사 선수 후보입니다. 향후 실제 레전드 성장 궤적 데이터와 10x10 Grid 데이터가 확보되면 고도화 예정입니다.")
-    if profile is None:
-        st.warning("FM 프로필 데이터가 없어 유사 선수 후보를 조회할 수 없습니다.")
+    if ctx["fallback_note"]:
+        st.info(ctx["fallback_note"])
+    if profile is None or profile.get("profile_id") is None:
+        st.warning("FM 프로필이 없어 유사 선수 후보를 조회할 수 없습니다.")
+        render_page_actions([
+            ("📈 커리어 시뮬레이션으로 이동", "커리어 시뮬레이션", "primary"),
+            ("📝 My Scouting Notes로 이동", "내 스카우팅 노트"),
+        ], title="FM 프로필 없음 · 다음 단계")
         return
     try:
         similar = get_similar_players(profile["profile_id"])
@@ -3675,20 +4975,38 @@ def render_legend_matching():
     for row in similar.to_dict("records"):
         profile_id = row.get("profile_id")
         mentor_rows[str(profile_id)] = row
-        candidate_profile = get_profile_by_profile_id(profile_id)
-        guide = generate_mentor_guide(player, row, parse_json_field(profile.get("attributes_jsonb")), parse_json_field(candidate_profile.get("attributes_jsonb")) if candidate_profile else {})
-        st.markdown(f"""<div class="scout-panel"><h3 style="margin-top:0;">{row.get('name') or '-'}</h3><div class="badge-row"><span class="scout-badge">나이 {row.get('age') or '-'}</span><span class="scout-badge">{row.get('position') or '-'}</span><span class="scout-badge">{row.get('club') or '-'}</span><span class="scout-badge">유사도 {row.get('similarity') or '-'}</span></div><p><b>공통 강점</b><br>{guide['similarity_reason']}</p><p><b>주요 차이점</b><br>{guide['improvement_points']}</p><p><b>전술적 해석</b><br>{guide['training_recommendation']}</p></div>""", unsafe_allow_html=True)
+        try:
+            candidate_profile = get_profile_by_profile_id(profile_id)
+        except Exception:
+            candidate_profile = None
+            st.error(f"{row.get('name') or '후보 선수'}의 프로필을 DB에서 조회하는 중 오류가 발생했습니다.")
+        selected_attrs = parse_json_field(profile.get("attributes_jsonb"))
+        candidate_attrs = parse_json_field(candidate_profile.get("attributes_jsonb")) if candidate_profile else {}
+        reason = generate_similarity_reason(player, row, selected_attrs, candidate_attrs)
+        guide = generate_mentor_guide(player, row, selected_attrs, candidate_attrs)
+        similarity = safe_float(row.get("similarity"), None)
+        similarity_text = f"{similarity:.4f}" if similarity is not None else "-"
+        st.markdown(f"""<div class="scout-panel"><h3 style="margin-top:0;">{row.get('name') or '-'}</h3><div class="badge-row"><span class="scout-badge">나이 {row.get('age') if row.get('age') is not None else '-'}</span><span class="scout-badge">{row.get('position') or '-'}</span><span class="scout-badge">{row.get('club') or '-'}</span><span class="scout-badge">유사도 {similarity_text}</span></div><p><b>공통 강점</b><br>{reason['common_strengths']}</p><p><b>주요 차이점</b><br>{reason['differences']}</p><p><b>전술적 해석</b><br>{reason['tactical_interpretation']}</p><p><b>유사 후보 선정 이유</b><br>{reason['similarity_reason']}</p></div>""", unsafe_allow_html=True)
         if st.button("멘토로 선택", key=f"select_mentor_{profile_id}"):
             st.session_state["selected_mentor_profile_id"] = profile_id
             st.session_state["selected_mentor_name"] = row.get("name")
+            st.session_state["mentor_summary"] = guide["mentor_summary"]
             st.success(f"{row.get('name')} 선수를 멘토 후보로 선택했습니다.")
     selected_mentor_profile_id = st.session_state.get("selected_mentor_profile_id")
     if selected_mentor_profile_id:
         mentor_row = mentor_rows.get(str(selected_mentor_profile_id))
-        mentor_profile = get_profile_by_profile_id(selected_mentor_profile_id)
+        try:
+            mentor_profile = get_profile_by_profile_id(selected_mentor_profile_id)
+        except Exception:
+            st.error("선택한 멘토 프로필을 DB에서 조회하는 중 오류가 발생했습니다.")
+            return
         if mentor_row is None:
             mentor_row = mentor_profile or {"profile_id": selected_mentor_profile_id, "name": st.session_state.get("selected_mentor_name")}
         render_mentor_guide(player, profile, mentor_row, mentor_profile)
+        render_page_actions([
+            ("📈 커리어 시뮬레이션으로 이동", "커리어 시뮬레이션", "primary"),
+            ("📄 스카우팅 리포트 생성", "AI 스카우팅 리포트"),
+        ])
 
 
 def get_report_sections(player, profile, env_settings, simulation_result):
@@ -3698,18 +5016,45 @@ def get_report_sections(player, profile, env_settings, simulation_result):
     strength_names = attr_names(top_attributes(attributes, limit=3)) or "주요 강점 데이터"
     weakness_names = attr_names(top_attributes(attributes, limit=2, reverse=False)) or "보완 데이터"
     mental_names = attr_names(top_attributes(basis, MENTALITY_KEYS, 2, True)) or "멘탈 강점"
-    mental_weak = attr_names(top_attributes(basis, MENTALITY_KEYS, 1, False)) or "멘탈 보완점"
-    sections = {
-        "종합 평가": f"{player.get('name')}은 현재 데이터 기준 {player.get('position') or '-'} 포지션의 유망주입니다. FM 기반 proxy style_vector를 기준으로 보면 {strength_names}이 돋보이는 유형으로 해석할 수 있습니다.",
-        "강점": f"{strength_names}이 상대적으로 높아 현재 역할에서 즉시 활용 가능한 강점으로 볼 수 있습니다. {mental_names} 역시 훈련 지속성과 전술 수행 능력 측면에서 긍정적인 신호입니다.",
-        "보완점": f"{weakness_names}은 향후 성장 과정에서 보완이 필요할 수 있습니다. {mental_weak}이 낮게 나타난다면 상위 리그 적응이나 큰 경기 대응에서 리스크가 생길 수 있습니다.",
-        "훈련 제안": "단기적으로는 약점을 모두 고치기보다 이미 높은 강점을 극대화하는 훈련이 적절합니다. 이후 패스, 판단력, 연계 플레이를 보완하면 더 다양한 전술 역할을 수행할 수 있습니다.",
-        "커리어 조언": f"{simulation_comment(env_settings, simulation_result)} 성공 가능성은 {format_percent(simulation_result.get('prototype_success_probability'))}로 계산되지만, 이는 실제 예측 모델이 아닌 프로토타입 결과입니다.",
-        "저장 정보": "저장 시 선수, 시뮬레이션 설정, 프로토타입 결과, 리포트 초안이 scouting_notes 테이블에 INSERT됩니다.",
+    mental_weak = attr_names(top_attributes(basis, MENTALITY_KEYS, 2, False)) or "멘탈 보완점"
+    age = profile.get("age") if isinstance(profile, dict) else None
+    player_name = player.get("name") or "선택 선수"
+    position = player.get("position") or "포지션 정보 없음"
+    club = player.get("current_club_name") or "소속팀 정보 없음"
+    growth_score = safe_float(simulation_result.get("prototype_growth_score"), None)
+    growth_text = f"{growth_score:.1f}" if growth_score is not None else "-"
+    success_text = format_percent(simulation_result.get("prototype_success_probability"))
+    injury_text = format_percent(simulation_result.get("prototype_injury_risk"))
+    mentor_summary = st.session_state.get("mentor_summary")
+    mentor_note = mentor_summary or "선택된 멘토가 없어 이번 초안에는 멘토링 가이드가 반영되지 않았습니다."
+
+    return {
+        "종합 평가": (
+            f"{player_name}은 나이 {age if age is not None else '-'}, {position}, {club} 소속으로 확인됩니다. "
+            f"선택 선수 데이터와 FM 기반 proxy 능력치를 종합하면 {strength_names}이 돋보이는 유형으로 해석할 수 있습니다."
+        ),
+        "강점": (
+            f"높은 능력치는 {strength_names}이며, 멘탈리티 강점은 {mental_names}입니다. "
+            "현재 역할에서 강점을 유지하면서 반복적으로 활용할 수 있는 경기 환경이 중요합니다."
+        ),
+        "보완점": (
+            f"낮은 능력치는 {weakness_names}이며, 멘탈리티 보완점은 {mental_weak}입니다. "
+            "상위 수준으로 이동하기 전 해당 지표가 실제 경기에서 어떤 제약으로 나타나는지 함께 확인해야 합니다."
+        ),
+        "훈련 제안": (
+            f"{position_training_hint(position, weakness_names)} 단기적으로는 {strength_names}을 유지하고, "
+            f"{weakness_names}과 {mental_weak}을 단계적으로 보완하는 훈련 구성이 적절합니다."
+        ),
+        "커리어 조언": (
+            f"{simulation_comment(env_settings, simulation_result)} 시뮬레이션 결과는 성장 점수 {growth_text}, "
+            f"성공 가능성 {success_text}, 부상 리스크 {injury_text}입니다. 이는 실제 예측 모델이 아닌 프로토타입 결과입니다."
+        ),
+        "멘토링 참고사항": mentor_note,
+        "저장 정보": (
+            "저장 시 선택 선수, 시뮬레이션 설정값, 프로토타입 결과, 템플릿 기반 리포트 초안이 "
+            "기존 scouting_notes 테이블에 저장됩니다. 앱은 DB 스키마를 자동 변경하지 않습니다."
+        ),
     }
-    if st.session_state.get("mentor_summary"):
-        sections["멘토링 반영"] = st.session_state["mentor_summary"]
-    return sections
 
 
 def render_ai_report():
@@ -3722,6 +5067,9 @@ def render_ai_report():
     simulation_result = st.session_state.get("simulation_result")
     if env_settings is None or simulation_result is None:
         st.warning("먼저 커리어 시뮬레이션 화면에서 시뮬레이션 설정을 생성해 주세요.")
+        render_page_actions([
+            ("📈 커리어 시뮬레이션으로 이동", "커리어 시뮬레이션", "primary"),
+        ])
         return
     render_player_profile_panel(player, profile)
     st.info("현재 리포트는 실제 Gemini API 호출 결과가 아니라, 선택 선수와 시뮬레이션 설정값을 바탕으로 생성한 템플릿 기반 초안입니다.")
@@ -3745,6 +5093,11 @@ def render_ai_report():
             st.error("스카우팅 노트 저장 중 오류가 발생했습니다.")
             with st.expander("개발 확인용 오류"):
                 st.exception(exc)
+
+    render_page_actions([
+        ("📝 My Scouting Notes에 저장/조회", "내 스카우팅 노트", "primary"),
+        ("🔎 새 유망주 검색", "유망주 검색"),
+    ])
 
 
 if __name__ == "__main__":
