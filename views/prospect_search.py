@@ -1,101 +1,134 @@
 import streamlit as st
 
-from services.db import get_distinct_positions, search_players_with_modes, show_selected_player_banner
+from services.db import get_distinct_positions, money, search_players, show_db_error
+from ui_components import render_page_actions
 
 
-def render_prospect_search():
+def render_prospect_search_view(show_selected_player_banner):
     st.title("유망주 검색")
-    st.caption("분석할 유망주를 검색하고 선택합니다. 선택한 후보는 다른 화면에서 FM/Transfermarkt 매칭 상태와 함께 재사용됩니다.")
-    st.info("유망주 기준: FM 데이터 기준 만 23세 이하. 후보는 matched / fm_profile_only / transfermarkt_only 상태를 함께 확인할 수 있습니다.")
 
-    max_age = st.slider("최대 나이", min_value=16, max_value=30, value=23, step=1)
-    try:
-        positions = get_distinct_positions(max_age=max_age)
-    except Exception:
-        positions = ["All"]
+    selected_name = st.session_state.get("selected_player_name")
+    if selected_name:
+        st.success(f"현재 선택된 선수: {selected_name}")
+        render_page_actions([
+            ("📊 통합 분석으로 이동", "유망주 통합 분석", "primary"),
+            ("🤝 유사 멘토 찾기", "유사 선수 후보"),
+        ], title="선수 선택 완료 · 다음 단계")
+    else:
+        show_selected_player_banner()
 
-    c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
+    st.markdown(
+        """
+        <div class="scout-panel">
+            <h3 style="margin-top:0;">검색 조건</h3>
+            유망주 기준: FM 데이터 기준 최대 나이 이하
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    c1, c2, c3 = st.columns([1, 1.4, 1])
     with c1:
-        keyword = st.text_input("선수 이름", placeholder="예: Bellingham, Yamal, Son")
+        max_age = st.slider("최대 나이", min_value=16, max_value=30, value=21, step=1)
     with c2:
-        position = st.selectbox("포지션", positions)
+        keyword = st.text_input("선수 이름", placeholder="예: Bellingham, Yamal, Son")
     with c3:
-        nationality = st.text_input("국적", placeholder="예: Korea")
+        try:
+            positions = get_distinct_positions(max_age=max_age)
+        except Exception as exc:
+            show_db_error("포지션 목록 조회", exc)
+            positions = ["All"]
+        position = st.selectbox("포지션", positions)
+
+    c4, c5 = st.columns(2)
     with c4:
+        nationality = st.text_input("국적", placeholder="예: Korea")
+    with c5:
         club = st.text_input("소속팀", placeholder="예: Dortmund")
 
-    try:
-        results = search_players_with_modes(keyword=keyword, position=position, nationality=nationality, club=club, max_age=max_age)
-    except Exception as exc:
-        st.error("선수 검색 중 오류가 발생했습니다.")
-        with st.expander("개발 확인용 오류"):
-            st.exception(exc)
+    filters = {
+        "keyword": keyword,
+        "position": position,
+        "nationality": nationality,
+        "club": club,
+        "max_age": max_age,
+    }
+
+    if st.button("유망주 검색", type="primary"):
+        try:
+            results = search_players(
+                keyword=keyword,
+                position=position,
+                nationality=nationality,
+                club=club,
+                max_age=max_age,
+            )
+            st.session_state["prospect_results"] = results
+            st.session_state["last_search_filters"] = filters
+        except Exception as exc:
+            show_db_error("유망주 검색", exc)
+            return
+
+    if "prospect_results" not in st.session_state:
+        st.info("검색 조건을 설정한 뒤 유망주 검색 버튼을 눌러주세요.")
         return
 
-    if results.empty:
-        st.info("검색 결과가 없습니다. 현재 검색은 candidate pool에서 matched / FM-only / Transfermarkt-only 후보를 함께 확인합니다.")
-        return
+    results = st.session_state["prospect_results"]
+    last_filters = st.session_state.get("last_search_filters", {})
 
     st.subheader("검색 결과")
-    st.caption("표시된 후보는 DB의 매칭 상태에 따라 통합 분석 가능 여부가 다를 수 있습니다.")
+    st.caption(
+        f"최대 나이 {last_filters.get('max_age', '-')}세, "
+        f"포지션 {last_filters.get('position', 'All')} 기준으로 조회한 결과입니다."
+    )
+
+    if results.empty:
+        st.warning("조건에 맞는 유망주가 없습니다. 최대 나이나 검색 조건을 조정해보세요.")
+        return
 
     for _, row in results.iterrows():
-        mode = row.get("search_mode") or "matched"
-        label = row.get("source_label") or "후보"
-        name = row.get("name") or "-"
-        age = row.get("age") if row.get("age") not in (None, "") else "-"
-        club_name = row.get("current_club_name") or "-"
-        position_name = row.get("position") or "-"
-        market_value = "-"
-        player_id = row.get("player_id")
-        profile_id = row.get("profile_id")
-
-        try:
-            from services.db import money
-            market_value = money(row.get("market_value_in_eur")) if row.get("market_value_in_eur") not in (None, "") else "-"
-        except Exception:
-            market_value = "-"
-
+        player_id = int(row["player_id"])
         st.markdown(
             f"""
             <div class="scout-panel">
-                <h3 style="margin-top:0;">{name}</h3>
+                <h3 style="margin-top:0;">{row.get('name') or '-'}</h3>
                 <div class="badge-row">
-                    <span class="scout-badge">모드 {mode}</span>
-                    <span class="scout-badge">{label}</span>
-                    <span class="scout-badge">나이 {age}</span>
-                    <span class="scout-badge">{position_name}</span>
+                    <span class="scout-badge">나이 {row.get('age') or '-'}</span>
+                    <span class="scout-badge">{row.get('position') or '-'}</span>
+                    <span class="scout-badge">{row.get('sub_position') or '-'}</span>
+                    <span class="scout-badge">{row.get('country_of_citizenship') or '-'}</span>
                 </div>
-                <p style="margin-bottom:0;"><b>소속팀</b> {club_name} · <b>현재 시장가치</b> {market_value}</p>
+                <p style="margin-bottom:0;">
+                    <b>소속팀</b> {row.get('current_club_name') or '-'} ·
+                    <b>현재 시장가치</b> {money(row.get('market_value_in_eur'))}
+                </p>
             </div>
             """,
             unsafe_allow_html=True,
         )
-
-        if st.button("이 후보 선택", key=f"select_mode_candidate_{mode}_{player_id or profile_id or row.name}", type="primary"):
-            st.session_state["selected_player_id"] = int(player_id) if player_id not in (None, "") else None
-            st.session_state["selected_profile_id"] = int(profile_id) if profile_id not in (None, "") else None
-            st.session_state["selected_entity_type"] = mode
-            st.session_state["selected_player_name"] = name
-            st.session_state["selected_search_mode"] = mode
-
-            for key in [
-                "selected_mentor_profile_id",
-                "selected_mentor_name",
-                "mentor_summary",
-                "manual_selected_mentor_profile_id",
-                "manual_selected_mentor_name",
-                "manual_mentor_summary",
-                "manual_analysis_result",
-                "manual_report_text",
-                "env_settings",
-                "simulation_result",
-                "generated_report_sections",
-                "generated_report",
-            ]:
-                st.session_state.pop(key, None)
-
-            st.success(f"{name} 후보를 선택했습니다. 현재 모드: {mode}")
-            st.info("홈/분석/유사 선수 화면에서 선택 결과를 이어서 확인할 수 있습니다.")
-
-    show_selected_player_banner()
+        if st.button("이 선수 선택", key=f"select_prospect_{player_id}"):
+            previous_player_id = st.session_state.get("selected_player_id")
+            st.session_state["selected_player_id"] = player_id
+            st.session_state["selected_player_name"] = row.get("name")
+            if previous_player_id != player_id:
+                for key in [
+                    "selected_mentor_profile_id",
+                    "selected_mentor_name",
+                    "mentor_summary",
+                    "env_settings",
+                    "simulation_result",
+                    "generated_report_sections",
+                    "generated_report",
+                    "generated_report_text",
+                    "growth_insight",
+                    "growth_explanation",
+                    "ceiling_growth_insight",
+                    "ceiling_growth_explanation",
+                    "ceiling_growth_context",
+                    "selected_profile_id",
+                    "selected_profile_fallback_note",
+                    "selected_entity_type",
+                ]:
+                    st.session_state.pop(key, None)
+            st.success("선수가 선택되었습니다. 유망주 통합 분석 화면에서 확인할 수 있습니다.")
+            st.info("왼쪽 메뉴에서 '유망주 통합 분석'으로 이동하세요.")

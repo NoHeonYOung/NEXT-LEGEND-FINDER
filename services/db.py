@@ -143,6 +143,7 @@ def search_players(keyword="", position="", nationality="", club="", max_age=23)
     sql = f"""
         select
             p.player_id,
+            pp.profile_id,
             {player_name} as name,
             pp.age,
             p.current_club_name,
