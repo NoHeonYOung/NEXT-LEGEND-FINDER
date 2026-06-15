@@ -1,6 +1,12 @@
+import json
+from datetime import datetime
+import inspect
+
+import numpy as np
 import pandas as pd
 from streamlit.testing.v1 import AppTest
 
+import scouting_note_payload
 from explanation_engine import build_growth_explanation
 from growth_model import (
     apply_ceiling_adjustment,
@@ -22,6 +28,16 @@ from growth_model import (
     map_risk_tendency,
     map_training_intensity,
 )
+from scouting_note_payload import (
+    build_ai_report_note_payload,
+    build_career_simulation_note_payload,
+    build_manual_note_payload,
+    compact_report_sections,
+    extract_structured_note_result,
+    json_safe,
+)
+from views.scouting_notes import ENTITY_TYPE_LABELS as SAVED_ENTITY_TYPE_LABELS
+from views.scouting_notes import NOTE_TYPE_LABELS, SOURCE_LABELS, saved_note_label
 
 
 def navigate_to(at, page):
@@ -352,6 +368,116 @@ def test_low_contribution_builds_coaching_training_direction():
     assert "기여도" in directions
 
 
+def structured_payload_inputs(entity_type="matched"):
+    growth_insight = {"growth_score": 61.0, "ceiling_model": {"final_growth_score": 69.0}}
+    growth_explanation = {
+        "summary": "성장 요약",
+        "ceiling_explanation": {
+            "coaching_summary": "코칭 총평",
+            "training_directions": ["훈련 방향"],
+        },
+    }
+    return {
+        "entity_type": entity_type,
+        "player": {"player_id": 10, "name": "Payload Player", "position": "ST"},
+        "profile": {"profile_id": 20, "name": "Payload Player", "position": "ST"},
+        "env_settings": {"training_intensity": 1.2, "career_choice": "stay"},
+        "simulation_result": {"prototype_growth_score": 55},
+        "growth_insight": growth_insight,
+        "growth_explanation": growth_explanation,
+        "ceiling_growth_insight": growth_insight,
+        "ceiling_growth_explanation": growth_explanation,
+        "ceiling_growth_context": {"entity_type": entity_type, "player_id": 10},
+        "report_sections": {"Ceiling Scenario Insight": "코칭 총평"},
+        "report_text": "저장 리포트",
+    }
+
+
+def test_ai_report_structured_note_payload():
+    payload = build_ai_report_note_payload(**structured_payload_inputs())
+    stored = payload["simulation_result"]
+
+    assert payload["env_settings"]["note_type"] == "ai_report"
+    assert payload["env_settings"]["source"] == "ai_report"
+    assert stored["growth_insight"]["growth_score"] == 61.0
+    assert stored["ceiling_growth_insight"]["ceiling_model"]["final_growth_score"] == 69.0
+    assert stored["report_sections"]["Ceiling Scenario Insight"] == "코칭 총평"
+    assert stored["generated_report_text"] == "저장 리포트"
+    json.dumps(payload, ensure_ascii=False)
+
+
+def test_manual_note_structured_note_payload():
+    inputs = structured_payload_inputs("manual_note")
+    inputs.update({
+        "player": {"name": "Manual Payload Player", "age": 18, "club": "Academy"},
+        "profile": None,
+        "env_settings": {
+            "note_type": "manual_custom_prospect",
+            "manual_player": {"name": "Manual Payload Player", "age": 18},
+            "manual_attributes": {"speed": 7},
+            "career_settings": {"training_intensity": 1.2},
+        },
+        "ceiling_growth_context": {"entity_type": "manual_note", "source": "manual_note"},
+    })
+    payload = build_manual_note_payload(**inputs)
+
+    assert payload["env_settings"]["note_type"] == "manual_custom_prospect"
+    assert payload["env_settings"]["source"] == "manual_note"
+    assert payload["env_settings"]["manual_player"]["name"] == "Manual Payload Player"
+    assert payload["simulation_result"]["growth_explanation"]["ceiling_explanation"]["coaching_summary"] == "코칭 총평"
+
+
+def test_career_simulation_structured_note_payload():
+    payload = build_career_simulation_note_payload(**structured_payload_inputs("transfermarkt_only"))
+
+    assert payload["env_settings"]["note_type"] == "career_simulation"
+    assert payload["env_settings"]["source"] == "career_simulation"
+    assert payload["env_settings"]["entity_type"] == "transfermarkt_only"
+    assert payload["simulation_result"]["prototype_simulation"]["prototype_growth_score"] == 55
+    assert payload["simulation_result"]["ceiling_growth_context"]["player_id"] == 10
+
+
+def test_legacy_note_structured_result_fallback():
+    legacy = {"prototype_growth_score": 44, "overall_summary": "legacy"}
+    restored = extract_structured_note_result(legacy)
+
+    assert restored["prototype_simulation"] == legacy
+    assert restored["growth_insight"] == {}
+    assert restored["ceiling_growth_explanation"] == {}
+
+
+def test_scouting_note_payload_json_safety_and_compaction():
+    converted = json_safe({
+        "datetime": datetime(2026, 6, 16, 1, 2, 3),
+        "tuple": (1, np.int64(2)),
+        "nan": np.float64(np.nan),
+        "pandas_na": pd.NA,
+    })
+    compacted = compact_report_sections({"긴 섹션": "x" * 6000})
+
+    assert converted["datetime"] == "2026-06-16T01:02:03"
+    assert converted["tuple"] == [1, 2]
+    assert converted["nan"] is None
+    assert converted["pandas_na"] is None
+    assert compacted["긴 섹션"].endswith("... [truncated]")
+    json.dumps({"converted": converted, "compacted": compacted}, ensure_ascii=False)
+
+
+def test_scouting_note_payload_has_no_ui_or_db_dependency():
+    source = inspect.getsource(scouting_note_payload)
+
+    assert "import streamlit" not in source
+    assert "services.db" not in source
+    assert "import app" not in source
+
+
+def test_saved_note_user_friendly_labels():
+    assert saved_note_label("manual_custom_prospect", NOTE_TYPE_LABELS, "-") == "직접 입력 선수 노트"
+    assert saved_note_label("career_simulation", SOURCE_LABELS, "-") == "커리어 시뮬레이션"
+    assert saved_note_label("matched", SAVED_ENTITY_TYPE_LABELS, "-") == "실제 DB + FM 매칭 선수"
+    assert saved_note_label("unknown", NOTE_TYPE_LABELS, "저장된 분석") == "저장된 분석"
+
+
 def test_explanation_engine_manual_note():
     manual_player = {"name": "Manual Player", "age": 19, "position": "CM"}
     manual_attributes = {"speed": 7, "dribble": 6, "finishing": 5, "passing": 7}
@@ -405,6 +531,7 @@ def test_career_simulation_ceiling_sections_render():
     assert "ceiling_explanation" in at.session_state["ceiling_growth_explanation"]
     assert at.session_state["ceiling_growth_context"]["player_id"] == 371998
     assert at.session_state["ceiling_growth_context"]["source"] == "career_simulation"
+    assert "현재 시뮬레이션 결과를 스카우팅 노트에 저장" in "\n".join(button.label for button in at.button)
 
 
 def test_manual_note_growth_insight_session_state():
@@ -412,6 +539,7 @@ def test_manual_note_growth_insight_session_state():
     at.run(timeout=30)
     navigate_to(at, "내 스카우팅 노트")
     assert not at.exception
+    assert "저장된 노트 조회" in "\n".join(s.value for s in at.subheader)
 
     name_inputs = [t for t in at.text_input if "이름" in (t.label or "")]
     assert name_inputs
@@ -433,6 +561,9 @@ def test_manual_note_growth_insight_session_state():
 
     metric_labels = "\n".join(m.label for m in at.metric)
     assert "Manual Final Growth Score" in metric_labels
+    button_labels = "\n".join(button.label for button in at.button)
+    assert "이 분석을 My Scouting Notes에 저장" in button_labels
+    assert "이 노트를 scouting_notes에 저장" not in button_labels
 
 
 def test_ceiling_result_survives_dashboard_and_ai_report():
@@ -463,6 +594,7 @@ def test_ceiling_result_survives_dashboard_and_ai_report():
     assert "리스크 경고" in ceiling_report
     assert "추천 커리어 전략" in ceiling_report
     assert "training_multiplier=" not in ceiling_report
+    assert "이 AI 리포트를 My Scouting Notes에 저장" in "\n".join(button.label for button in at.button)
 
 
 def test_selecting_different_player_clears_growth_session_state():
@@ -542,6 +674,20 @@ if __name__ == "__main__":
     print("test_manual_note_ceiling_model_and_explanation OK")
     test_low_contribution_builds_coaching_training_direction()
     print("test_low_contribution_builds_coaching_training_direction OK")
+    test_ai_report_structured_note_payload()
+    print("test_ai_report_structured_note_payload OK")
+    test_manual_note_structured_note_payload()
+    print("test_manual_note_structured_note_payload OK")
+    test_career_simulation_structured_note_payload()
+    print("test_career_simulation_structured_note_payload OK")
+    test_legacy_note_structured_result_fallback()
+    print("test_legacy_note_structured_result_fallback OK")
+    test_scouting_note_payload_json_safety_and_compaction()
+    print("test_scouting_note_payload_json_safety_and_compaction OK")
+    test_scouting_note_payload_has_no_ui_or_db_dependency()
+    print("test_scouting_note_payload_has_no_ui_or_db_dependency OK")
+    test_saved_note_user_friendly_labels()
+    print("test_saved_note_user_friendly_labels OK")
     test_explanation_engine_data_driven()
     print("test_explanation_engine_data_driven OK")
     test_explanation_engine_manual_note()

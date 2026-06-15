@@ -362,3 +362,82 @@ AI Report도 동일 코칭 설명을 사용하며 Gemini API를 호출하지 않
 - v13 session_state key 분리 및 context 우선 선택 구조를 유지한다.
 - 공식과 최종 점수 범위를 변경하지 않는다.
 - 위험도 가산 규칙은 rule-based calibration이며 실제 데이터 검증 전까지 예측 모델로 해석하지 않는다.
+
+---
+
+## 17. v16: Scouting Notes structured persistence
+
+### 17.1 저장 컬럼과 payload
+
+DB 스키마는 변경하지 않는다. `scouting_notes.env_settings` JSONB에는 기존 입력값과 함께 아래 메타데이터를 저장한다.
+
+- `note_type`, `source`, `entity_type`
+- `player_snapshot`, `profile_snapshot`
+- `ceiling_growth_context`
+- `career_settings`
+
+`scouting_notes.simulation_result` JSONB는 기존 prototype 최상위 key를 유지하며 아래 구조를 append-only로 추가한다.
+
+- `prototype_simulation`
+- `growth_insight`, `growth_explanation`
+- `ceiling_growth_insight`, `ceiling_growth_explanation`, `ceiling_growth_context`
+- `report_sections`, `generated_report_text`
+
+`gemini_report` text에는 Gemini 호출 없이 생성한 template/fallback 리포트 문자열을 저장한다.
+
+### 17.2 화면별 저장
+
+- Career Simulation: `source="career_simulation"` 저장 버튼으로 현재 선수의 시뮬레이션과 코칭 결과를 저장한다.
+- AI Report: `source="ai_report"`로 report sections/text와 현재 context에 맞는 Ceiling 결과를 저장한다.
+- Manual Note: `source="manual_note"`, `note_type="manual_custom_prospect"`로 직접 입력값과 코칭 결과를 저장한다.
+
+### 17.3 조회 및 legacy fallback
+
+My Scouting Notes는 신규 구조가 있으면 Growth Score, Final Growth Score, 시나리오 총평,
+추천 훈련 방향, 기대 장점, 소홀히 했을 때의 단점, 리스크 경고, 추천 커리어 전략을 복원한다.
+신규 key가 없는 legacy note는 기존 simulation/result/report 표시 흐름을 유지하며 예외 없이 fallback한다.
+
+### 17.4 불변 조건
+
+- `services/db.py`는 SELECT/INSERT 역할만 유지하고 JSONB payload 조립은 순수 helper에서 수행한다.
+- DB 스키마와 기존 `insert_scouting_note()` 시그니처를 변경하지 않는다.
+- 저장된 결과는 당시 모델/설명 결과의 스냅샷이며 조회 시 재계산하지 않는다.
+- payload 단위 테스트는 JSON 직렬화와 세 source 구분을 검증하며 실제 DB INSERT는 수행하지 않는다.
+
+---
+
+## 18. v16.1: Persistence QA and saved-note UI polish
+
+### 18.1 저장 결과 표시 정책
+
+- 저장된 Growth/Ceiling/Coaching 결과는 저장 시점 스냅샷으로 표시하며 현재 모델로 재계산하지 않는다.
+- 사용자 화면에는 한국어 저장 유형/출처/선수 유형 배지, 선수 스냅샷, 기본 성장 점수,
+  시나리오 반영 성장 점수, 저장된 코칭 리포트를 표시한다.
+- 내부 JSON key와 원본 payload는 개발자용 expander에서만 표시한다.
+- 구조화 summary/strengths/risks가 있으면 카드 fallback으로 활용하고, 없으면 legacy 표시를 유지한다.
+
+### 18.2 Payload 안전성 정책
+
+- helper는 Streamlit, DB, app.py를 import하지 않는다.
+- datetime, tuple, numpy/pandas scalar, NaN/NA는 JSON 직렬화 가능한 값으로 정규화한다.
+- report sections는 최대 50개, 문자열 섹션당 5,000자로 compact한다.
+- 신규 key가 없거나 잘못된 타입이어도 `extract_structured_note_result`는 빈 구조와 legacy prototype으로 fallback한다.
+
+### 18.3 실제 DB 수동 검수 절차
+
+1. 실제 선수 선택 후 Career Simulation 결과를 저장하고 `note_id`를 확인한다.
+2. My Scouting Notes에서 한국어 배지, 선수 정보, 기본/시나리오 성장 점수와 코칭 리포트를 확인한다.
+3. AI Report 저장 후 리포트 문자열과 구조화 Growth/Ceiling 결과가 함께 복원되는지 확인한다.
+4. Manual Note 저장 후 직접 입력 선수 배지와 코칭 결과가 일반 DB 선수와 구분되는지 확인한다.
+5. legacy note가 예외 없이 기존 정보로 표시되는지 확인한다.
+
+자동 테스트 및 Codex 작업에서는 사용자 명시 확인 없이 실제 DB INSERT를 수행하지 않는다.
+
+### 18.4 QA 테스트 범위
+
+- 세 저장 source payload의 JSON 직렬화 가능 여부
+- datetime/tuple/numpy·pandas scalar/NaN/NA 변환
+- 큰 report section compact 처리
+- payload helper의 UI/DB/app.py 비의존성
+- 사용자용 저장 유형 라벨과 신규/legacy 복원
+- 저장 버튼 렌더링 및 My Scouting Notes 조회 화면 무예외 실행

@@ -21,8 +21,36 @@ from growth_model import (
     classify_risk_tendency,
     classify_training_intensity,
 )
+from scouting_note_payload import build_manual_note_payload, extract_structured_note_result
 from services.db import get_scouting_notes, insert_scouting_note, query_df
 from ui_components import render_page_actions
+
+
+NOTE_TYPE_LABELS = {
+    "ai_report": "AI 리포트 저장",
+    "career_simulation": "커리어 시뮬레이션 저장",
+    "manual_custom_prospect": "직접 입력 선수 노트",
+    "legacy_note": "이전 형식 노트",
+}
+
+SOURCE_LABELS = {
+    "ai_report": "AI 리포트",
+    "career_simulation": "커리어 시뮬레이션",
+    "manual_note": "직접 입력 분석",
+    "legacy": "이전 저장 데이터",
+}
+
+ENTITY_TYPE_LABELS = {
+    "matched": "실제 DB + FM 매칭 선수",
+    "transfermarkt_only": "실제 DB 선수",
+    "fm_profile_only": "FM 프로필 선수",
+    "manual_note": "직접 입력 선수",
+    "db_player": "실제 DB 선수",
+}
+
+
+def saved_note_label(value, labels, fallback):
+    return labels.get(value, fallback)
 
 
 def note_summary_text(note):
@@ -589,16 +617,39 @@ def render_scouting_notes_view():
 
         st.markdown("<div class='scout-panel'><b>장점과 리스크</b><br>" + "<br>".join(analysis.get('risk_factors', []) or ["현재 입력값 기준 리스크는 아직 충분하지 않습니다."]) + "</div>", unsafe_allow_html=True)
 
-        if st.button("이 노트를 scouting_notes에 저장", type="primary"):
+        if st.button("이 분석을 My Scouting Notes에 저장", type="primary"):
             try:
+                preview_growth_explanation = preview.get("growth_explanation") or {}
+                preview_ceiling_explanation = preview_growth_explanation.get("ceiling_explanation") or {}
+                report_sections = {
+                    "Growth Model Insight": preview_growth_explanation.get("summary", ""),
+                    "Ceiling Scenario Insight": preview_ceiling_explanation.get("coaching_summary", ""),
+                }
+                payload = build_manual_note_payload(
+                    entity_type="manual_note",
+                    player=preview.get("env_settings", {}).get("manual_player"),
+                    profile=None,
+                    env_settings=normalize_env_settings(preview.get("env_settings")),
+                    simulation_result=preview["simulation_result"],
+                    growth_insight=preview.get("growth_insight"),
+                    growth_explanation=preview.get("growth_explanation"),
+                    ceiling_growth_insight=st.session_state.get("ceiling_growth_insight"),
+                    ceiling_growth_explanation=st.session_state.get("ceiling_growth_explanation"),
+                    ceiling_growth_context=st.session_state.get("ceiling_growth_context"),
+                    report_sections=report_sections,
+                    report_text=preview["report"],
+                )
                 saved = insert_scouting_note(
                     player_id=None,
                     profile_id=None,
-                    env_settings=normalize_env_settings(preview.get("env_settings")),
-                    simulation_result=preview["simulation_result"],
-                    report=preview["report"],
+                    env_settings=payload["env_settings"],
+                    simulation_result=payload["simulation_result"],
+                    report=payload["report"],
                 )
-                st.success(f"직접 입력 노트가 저장되었습니다. note_id: {saved['note_id']}")
+                st.success(
+                    f"직접 입력 선수 분석이 스카우팅 노트에 저장되었습니다. "
+                    f"My Scouting Notes에서 다시 확인할 수 있습니다. note_id: {saved['note_id']}"
+                )
             except Exception as exc:
                 st.error("직접 입력 노트 저장 중 오류가 발생했습니다.")
                 with st.expander("개발 확인용 오류"):
@@ -633,9 +684,15 @@ def render_scouting_notes_view():
     for _, note in notes.iterrows():
         env = parse_json_field(note.get("env_settings")) or {}
         sim = parse_json_field(note.get("simulation_result")) or {}
+        structured = extract_structured_note_result(sim)
+        stored_growth = structured["ceiling_growth_insight"] or structured["growth_insight"]
+        stored_explanation = structured["ceiling_growth_explanation"] or structured["growth_explanation"]
+        coaching = stored_explanation.get("ceiling_explanation") if isinstance(stored_explanation, dict) else {}
+        coaching = coaching if isinstance(coaching, dict) else {}
         manual_player = env.get("manual_player") if isinstance(env, dict) and isinstance(env.get("manual_player"), dict) else {}
         legacy_player = env.get("player") if isinstance(env, dict) and isinstance(env.get("player"), dict) else {}
-        player_snapshot = manual_player or legacy_player
+        saved_player = env.get("player_snapshot") if isinstance(env, dict) and isinstance(env.get("player_snapshot"), dict) else {}
+        player_snapshot = saved_player or manual_player or legacy_player
         if not player_snapshot and note.get("player_name"):
             player_snapshot = {
                 "name": safe_text(note.get("player_name"), "이름 없는 노트"),
@@ -645,19 +702,37 @@ def render_scouting_notes_view():
                 "nationality": env.get("nationality"),
             }
         title = note_display_title(note)
-        summary = safe_text(sim.get("overall_summary"), note_summary_text(note))
+        stored_summary = stored_explanation.get("summary") if isinstance(stored_explanation, dict) else None
+        summary = safe_text(sim.get("overall_summary") or stored_summary or coaching.get("coaching_summary"), note_summary_text(note))
         strengths = sim.get("strengths") if isinstance(sim, dict) else []
         weaknesses = sim.get("weaknesses") if isinstance(sim, dict) else []
+        if not strengths and isinstance(stored_explanation, dict):
+            strengths = stored_explanation.get("strengths") or []
+        if not weaknesses and isinstance(stored_explanation, dict):
+            weaknesses = stored_explanation.get("risks") or []
         mentor_name = env.get("selected_mentor_name") or "선택된 멘토 없음"
-        growth_score = sim.get("prototype_growth_score", "-")
+        growth_score = stored_growth.get("growth_score", sim.get("prototype_growth_score", "-"))
+        ceiling_model = stored_growth.get("ceiling_model") if isinstance(stored_growth.get("ceiling_model"), dict) else {}
+        final_growth_score = ceiling_model.get("final_growth_score", "-")
         injury_risk = sim.get("prototype_injury_risk")
         preview_text = safe_text(note.get("gemini_report"), "")
+        note_type = env.get("note_type") or "legacy_note"
+        source = env.get("source") or "legacy"
+        entity_type = env.get("entity_type") or ("manual_note" if manual_player else "db_player")
+        note_type_label = saved_note_label(note_type, NOTE_TYPE_LABELS, "저장된 분석")
+        source_label = saved_note_label(source, SOURCE_LABELS, "저장 출처 정보 없음")
+        entity_type_label = saved_note_label(entity_type, ENTITY_TYPE_LABELS, "선수 유형 정보 없음")
 
         st.markdown(
             f"""
             <div class="scout-panel">
                 <h3 style="margin-top:0;">{title}</h3>
                 <div class="muted">저장일 {note.get('created_at')}</div>
+                <div class="badge-row">
+                    <span class="scout-badge">{note_type_label}</span>
+                    <span class="scout-badge">{source_label}</span>
+                    <span class="scout-badge">{entity_type_label}</span>
+                </div>
                 <p><b>나이 / 포지션 / 소속팀 / 국적</b><br>
                 {safe_text(player_snapshot.get('age'), '-') if isinstance(player_snapshot, dict) else '-'}세 ·
                 {safe_text(player_snapshot.get('position'), '-') if isinstance(player_snapshot, dict) else '-'} ·
@@ -668,12 +743,12 @@ def render_scouting_notes_view():
                 <p><b>핵심 강점</b><br>{' · '.join(str(item) for item in strengths[:3]) if strengths else '정보 없음'}</p>
                 <p><b>보완점</b><br>{' · '.join(str(item) for item in weaknesses[:2]) if weaknesses else '정보 없음'}</p>
                 <p><b>선택한 멘토</b><br>{mentor_name}</p>
-                <p><b>성장 가능성 / 부상 리스크</b><br>{growth_score} / {format_percent(injury_risk)}</p>
+                <p><b>기본 성장 점수 / 시나리오 반영 성장 점수 / 부상 리스크</b><br>{growth_score} / {final_growth_score} / {format_percent(injury_risk)}</p>
             </div>
             """,
             unsafe_allow_html=True,
         )
-        with st.expander("상세 보기"):
+        with st.expander("저장된 분석 결과 보기"):
             st.write("### 종합 평가")
             st.write(summary)
             if strengths:
@@ -690,8 +765,23 @@ def render_scouting_notes_view():
             if preview_text:
                 st.write("### 리포트 요약")
                 st.text(preview_text[:500])
+            if coaching:
+                st.write("### 저장된 코칭 리포트")
+                st.write(coaching.get("coaching_summary") or coaching.get("ceiling_summary") or "시나리오 총평 정보 없음")
+                for label, key in [
+                    ("추천 훈련 방향", "training_directions"),
+                    ("기대 장점", "expected_benefits"),
+                    ("소홀히 했을 때의 단점", "neglect_risks"),
+                    ("리스크 경고", "risk_warnings"),
+                    ("추천 커리어 전략", "career_strategy"),
+                ]:
+                    items = coaching.get(key)
+                    if items:
+                        st.write(f"### {label}")
+                        for item in items:
+                            st.write("- " + str(item))
         with st.expander("개발자용 원본 JSON 보기"):
-            st.json({"env_settings": env, "simulation_result": sim, "gemini_report": note.get("gemini_report")})
+            st.json({"env_settings": env, "simulation_result": sim, "structured_result": structured, "gemini_report": note.get("gemini_report")})
 
     render_page_actions([
         ("🔎 새 유망주 검색", "유망주 검색", "primary"),

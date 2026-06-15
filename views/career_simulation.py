@@ -12,7 +12,8 @@ from analysis_helpers import (
 )
 from explanation_engine import build_growth_explanation
 from growth_model import FEATURE_LABELS, apply_ceiling_adjustment, build_growth_insight
-from services.db import get_appearances, get_valuations
+from scouting_note_payload import build_career_simulation_note_payload
+from services.db import get_appearances, get_valuations, insert_scouting_note
 from ui_components import render_page_actions, render_player_profile_panel
 
 
@@ -189,6 +190,45 @@ def render_career_simulation_view(player, profile, entity_type=None):
             st.markdown(f'<div class="section-note">{f_diff_text}</div>', unsafe_allow_html=True)
 
         st.caption("데이터 커버리지: " + " / ".join(growth_explanation["data_limitations"]))
+
+        if st.button("현재 시뮬레이션 결과를 스카우팅 노트에 저장"):
+            try:
+                report_sections = {
+                    "Growth Model Insight": growth_explanation.get("summary", ""),
+                    "Ceiling Scenario Insight": ceiling_explanation.get("coaching_summary", ""),
+                }
+                report_text = "\n\n".join(
+                    f"{title}\n{body}" for title, body in report_sections.items() if body
+                )
+                payload = build_career_simulation_note_payload(
+                    entity_type=entity_type,
+                    player=player,
+                    profile=profile,
+                    env_settings=env_settings,
+                    simulation_result=simulation_result,
+                    growth_insight=growth_insight,
+                    growth_explanation=growth_explanation,
+                    ceiling_growth_insight=st.session_state.get("ceiling_growth_insight"),
+                    ceiling_growth_explanation=st.session_state.get("ceiling_growth_explanation"),
+                    ceiling_growth_context=st.session_state.get("ceiling_growth_context"),
+                    report_sections=report_sections,
+                    report_text=report_text,
+                )
+                saved = insert_scouting_note(
+                    player_id=player.get("player_id"),
+                    profile_id=profile.get("profile_id") if isinstance(profile, dict) else None,
+                    env_settings=payload["env_settings"],
+                    simulation_result=payload["simulation_result"],
+                    report=payload["report"],
+                )
+                st.success(
+                    f"현재 시뮬레이션 결과가 스카우팅 노트에 저장되었습니다. "
+                    f"My Scouting Notes에서 다시 확인할 수 있습니다. note_id: {saved['note_id']}"
+                )
+            except Exception as exc:
+                st.error("시뮬레이션 결과 저장 중 오류가 발생했습니다.")
+                with st.expander("개발 확인용 오류"):
+                    st.exception(exc)
     else:
         st.info("Real Data Growth Baseline은 Transfermarkt/FM 데이터와 매칭된 선수에서만 표시됩니다. (직접 입력 노트는 prototype 점수만 제공됩니다.)")
 

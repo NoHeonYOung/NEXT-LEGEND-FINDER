@@ -10,6 +10,7 @@ from analysis_helpers import (
     simulation_comment,
     top_attributes,
 )
+from scouting_note_payload import build_ai_report_note_payload
 from services.db import insert_scouting_note
 from ui_components import render_page_actions, render_player_profile_panel
 
@@ -161,16 +162,44 @@ def render_ai_report_view(player, profile):
         sections = get_report_sections(player, profile, env_settings, simulation_result, growth_insight, growth_explanation)
         st.session_state["generated_report_sections"] = sections
         st.session_state["generated_report"] = sections_to_report_text(sections)
+        st.session_state["generated_report_text"] = st.session_state["generated_report"]
     sections = st.session_state.get("generated_report_sections")
     report = st.session_state.get("generated_report")
     if not sections:
         return
     for title, body in sections.items():
         st.markdown(f'<div class="report-block"><h3 style="margin-top:0;">{title}</h3>{body}</div>', unsafe_allow_html=True)
-    if st.button("스카우팅 노트에 저장"):
+    if st.button("이 AI 리포트를 My Scouting Notes에 저장"):
         try:
-            saved = insert_scouting_note(player_id=player["player_id"], profile_id=profile.get("profile_id") if profile else None, env_settings=env_settings, simulation_result=simulation_result, report=report)
-            st.success(f"스카우팅 노트가 저장되었습니다. note_id: {saved['note_id']}")
+            entity_type = st.session_state.get("selected_entity_type")
+            growth_insight, growth_explanation = get_current_growth_result(player, profile, entity_type)
+            ceiling_context = st.session_state.get("ceiling_growth_context")
+            context_is_current = is_ceiling_context_current(ceiling_context, player, profile, entity_type)
+            payload = build_ai_report_note_payload(
+                entity_type=entity_type,
+                player=player,
+                profile=profile,
+                env_settings=env_settings,
+                simulation_result=simulation_result,
+                growth_insight=growth_insight,
+                growth_explanation=growth_explanation,
+                ceiling_growth_insight=st.session_state.get("ceiling_growth_insight") if context_is_current else None,
+                ceiling_growth_explanation=st.session_state.get("ceiling_growth_explanation") if context_is_current else None,
+                ceiling_growth_context=ceiling_context if context_is_current else None,
+                report_sections=sections,
+                report_text=report,
+            )
+            saved = insert_scouting_note(
+                player_id=player["player_id"],
+                profile_id=profile.get("profile_id") if profile else None,
+                env_settings=payload["env_settings"],
+                simulation_result=payload["simulation_result"],
+                report=payload["report"],
+            )
+            st.success(
+                f"AI 리포트가 스카우팅 노트에 저장되었습니다. "
+                f"My Scouting Notes에서 다시 확인할 수 있습니다. note_id: {saved['note_id']}"
+            )
         except Exception as exc:
             st.error("스카우팅 노트 저장 중 오류가 발생했습니다.")
             with st.expander("개발 확인용 오류"):

@@ -3,6 +3,42 @@
 
 ---
 
+# v16.1: Persistence QA and saved-note UI polish
+
+- `scouting_note_payload.py::json_safe`: datetime/tuple/numpy·pandas scalar/NaN/NA 변환을 보장한다.
+- `scouting_note_payload.py::compact_report_sections`: 최대 50개 섹션과 섹션당 5,000자 제한으로
+  JSONB payload 크기를 방어한다.
+- `views/scouting_notes.py::saved_note_label`: 내부 저장 type/source/entity 값을 사용자용 배지로 변환한다.
+- 저장 노트 카드: 구조화 Growth 설명을 summary/strengths/weaknesses fallback으로 사용한다.
+- 저장 버튼 UX: Career/AI/Manual 저장 성공 후 My Scouting Notes 재확인 경로를 안내한다.
+- 신규/legacy 복원은 `extract_structured_note_result` 단일 흐름을 유지한다.
+
+실제 DB INSERT는 자동 테스트에서 수행하지 않으며, AppTest는 조회 및 버튼/렌더링 흐름만 검증한다.
+
+---
+
+# v16: Scouting Notes structured persistence
+
+## 신규 helper: `scouting_note_payload.py`
+
+- `json_safe`: 날짜/numpy 계열 값을 JSONB에 안전한 값으로 변환한다.
+- `build_player_snapshot`, `build_profile_snapshot`: 저장 시점 선수/프로필 메타데이터를 만든다.
+- `build_ai_report_note_payload`: `note_type/source="ai_report"` 구조화 payload 생성.
+- `build_manual_note_payload`: `note_type="manual_custom_prospect"`, `source="manual_note"` payload 생성.
+- `build_career_simulation_note_payload`: `note_type/source="career_simulation"` payload 생성.
+- `extract_structured_note_result`: 신규 구조를 복원하고 legacy note는 기존 simulation dict로 fallback한다.
+
+## 수정된 view 흐름
+
+- `views/ai_report.py::render_ai_report_view`: 저장 버튼에서 report/Growth/Ceiling/context를 JSONB payload로 묶는다.
+- `views/career_simulation.py::render_career_simulation_view`: 실제 DB 선수 분석 결과 저장 버튼을 제공한다.
+- `views/scouting_notes.py::render_scouting_notes_view`: Manual Note 구조화 저장, source 배지,
+  Growth/Final Growth Score 및 코칭 리포트 복원을 수행한다.
+
+`services/db.py::insert_scouting_note`와 `get_scouting_notes`의 역할과 시그니처, DB 스키마는 변경하지 않았다.
+
+---
+
 # v14: scoring calibration + coaching-style explanation 개선
 
 ## 핵심 함수

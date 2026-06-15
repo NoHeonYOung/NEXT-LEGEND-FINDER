@@ -52,6 +52,22 @@
 - 선택 조합의 위험도 calibration은 허용하지만 Growth Model 및 Ceiling Model 핵심 공식,
   ±15 scenario adjustment 범위, 0~100 Final Growth Score 범위는 변경하지 않는다.
 
+## Scouting Notes Persistence Invariants
+
+- `scouting_notes` DB 스키마와 기존 `insert_scouting_note()` 시그니처를 변경하지 않는다.
+- `env_settings` JSONB의 `note_type`, `source`, `entity_type`, snapshots, `ceiling_growth_context`,
+  `career_settings` 메타데이터 구조를 유지한다.
+- `simulation_result` JSONB의 기존 prototype 최상위 key를 유지하고, 구조화 Growth/Ceiling/Coaching
+  결과는 append-only key로 저장한다.
+- AI Report, Manual Note, Career Simulation 저장은 `scouting_note_payload.py`의 순수 helper를 사용한다.
+- 신규 구조가 없는 legacy note 조회 fallback을 제거하거나 깨지 않는다.
+- 저장된 Growth/Ceiling 결과는 저장 시점 스냅샷이며 조회 시 현재 공식으로 자동 재계산하지 않는다.
+- 실제 `scouting_notes` DB INSERT 테스트는 사용자 명시 확인 없이 수행하지 않는다.
+- payload helper의 Streamlit/DB/app.py 비의존성과 JSON 직렬화 안전성을 유지한다.
+- 저장 노트 기본 화면에는 내부 JSON key 대신 사용자용 라벨을 표시하고 원본 payload는 expander에 둔다.
+- Scouting Notes 저장/조회 구조를 변경하면 `CLAUDE_PROGRESS_SUMMARY.md`, `ACTIVE_FUNCTION_MAP.md`,
+  `REAL_MODEL_PLAN.md`, `AGENTS.md`를 같은 작업에서 최신화한다.
+
 ## Required Verification
 
 코드 또는 동작에 영향을 주는 변경 후 아래 테스트를 반드시 실행하고 결과를 보고한다.

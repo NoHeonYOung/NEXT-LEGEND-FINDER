@@ -5,6 +5,89 @@
 
 ---
 
+# 최신 상태 요약 v16.1: Persistence QA and saved-note UI polish
+
+v16 구조화 저장 구조를 유지하면서 실제 앱의 저장/조회 UX와 payload 안전성을 점검했다.
+테스트 과정에서는 실제 `scouting_notes` INSERT를 수행하지 않았다.
+
+## v16.1.1 QA 및 UI 개선
+
+- My Scouting Notes의 raw `note_type/source/entity_type` 대신 사용자용 한국어 배지를 표시한다.
+- Career/AI 저장 노트에 legacy `overall_summary/strengths/weaknesses`가 없어도 저장된
+  Growth/Coaching 설명으로 카드 내용을 복원한다.
+- 기본 화면은 `기본 성장 점수`와 `시나리오 반영 성장 점수`로 표시하고 내부 JSON key는
+  개발자용 expander 안에만 둔다.
+- Career Simulation, AI Report, Manual Note 저장 성공 문구에 My Scouting Notes 재확인 안내를 추가했다.
+- Manual/AI 저장 버튼명을 사용자가 이해하기 쉬운 문구로 변경했다.
+
+## v16.1.2 Payload QA
+
+- `scouting_note_payload.py`는 Streamlit/DB/app.py 의존성이 없음을 테스트한다.
+- datetime, tuple, numpy/pandas scalar, NaN/NA를 JSON-safe 값으로 변환한다.
+- report sections는 최대 50개, 문자열 섹션당 5,000자로 compact한다.
+- 신규/legacy note 복원과 source/note type 구분을 검증한다.
+
+## v16.1.3 사용자 수동 검수 체크리스트
+
+1. Streamlit 실행 후 Prospect Search에서 선수를 선택한다.
+2. Career Simulation에서 조건을 조정하고 저장 버튼을 누른다.
+3. 저장 성공 메시지의 `note_id`와 My Scouting Notes 재확인 안내를 확인한다.
+4. My Scouting Notes에서 방금 저장한 노트의 한국어 배지, 선수 스냅샷, 기본/시나리오 성장 점수를 확인한다.
+5. `저장된 분석 결과 보기`에서 코칭 총평과 훈련·위험·커리어 전략을 확인한다.
+6. 개발자용 JSON이 별도 expander 안에 있는지 확인한다.
+7. AI Report와 Manual Note도 각각 한 번 저장해 동일한 복원 흐름을 확인한다.
+
+실제 INSERT 검수는 사용자가 위 절차로 명시적으로 수행할 때만 진행한다.
+
+## v16.1.4 테스트 결과
+
+- `python -m compileall .` 통과
+- `test_state_refactor.py` 3/3, `test_analysis_helpers_split.py` 4/4,
+  `test_prospect_search_split.py` 2/2, `test_growth_model.py` 29/29 통과
+- Streamlit health check HTTP 200, 응답 `ok`
+- 실제 DB INSERT 테스트는 수행하지 않았다.
+
+---
+
+# 최신 상태 요약 v16: Scouting Notes structured persistence
+
+DB 스키마와 `insert_scouting_note()` 시그니처를 변경하지 않고, 기존 `env_settings`/`simulation_result`
+JSONB 컬럼에 Growth/Ceiling/Coaching 결과를 구조화 저장하도록 강화했다.
+
+## v16.1 신규/수정 파일
+
+- 신규 `scouting_note_payload.py`: AI Report, Manual Note, Career Simulation 저장 payload와
+  legacy/new note 복원 helper를 제공한다. Streamlit과 DB를 import하지 않는다.
+- `views/ai_report.py`: 현재 선수/context와 일치하는 Growth/Ceiling 결과, report sections/text를 저장한다.
+- `views/scouting_notes.py`: Manual Note 구조화 저장 및 저장된 Growth Score, Final Growth Score,
+  코칭 리포트 복원을 지원한다.
+- `views/career_simulation.py`: 현재 시뮬레이션 결과를 저장하는 작은 버튼을 추가했다.
+- `test_growth_model.py`: 세 source payload와 legacy fallback 테스트를 추가해 26개 테스트로 확장했다.
+
+## v16.2 JSONB 저장 구조
+
+- `env_settings`: 기존 설정을 유지하고 `note_type`, `source`, `entity_type`, `player_snapshot`,
+  `profile_snapshot`, `ceiling_growth_context`, `career_settings`를 추가한다.
+- `simulation_result`: 기존 최상위 prototype 필드를 유지하고 `prototype_simulation`,
+  `growth_insight`, `growth_explanation`, `ceiling_growth_insight`, `ceiling_growth_explanation`,
+  `ceiling_growth_context`, `report_sections`, `generated_report_text`를 추가한다.
+- `gemini_report`: Gemini 호출 없이 기존 fallback/template 리포트 문자열을 계속 저장한다.
+
+## v16.3 호환성과 남은 문제
+
+- 신규 구조가 없는 legacy note는 기존 `env_settings`/`simulation_result`/`gemini_report` 표시 방식으로 fallback한다.
+- JSONB 구조는 rule-based 결과 스냅샷이며, 저장 후 모델 공식이나 설명 템플릿이 바뀌어도 자동 재계산되지 않는다.
+
+## v16.4 테스트 결과
+
+- `python -m compileall .` 통과
+- `test_state_refactor.py` 3/3, `test_analysis_helpers_split.py` 4/4,
+  `test_prospect_search_split.py` 2/2, `test_growth_model.py` 26/26 통과
+- Streamlit health check HTTP 200, 응답 `ok`
+- 테스트 중 실제 `scouting_notes` INSERT는 수행하지 않아 운영 데이터를 오염시키지 않았다.
+
+---
+
 # 최신 상태 요약 v14: scoring calibration + coaching-style explanation 개선
 
 - Growth Model과 Ceiling Model 핵심 공식, ±15 보정 범위, session_state 구조는 유지했다.
