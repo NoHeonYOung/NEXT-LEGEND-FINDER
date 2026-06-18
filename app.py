@@ -11,6 +11,7 @@ from views.ai_report import render_ai_report_view
 from views.legend_matching import render_legend_matching_view
 from views.dashboard import render_dashboard_view
 from views.scouting_notes import render_scouting_notes_view
+from views.manual_prospect import render_manual_prospect_view
 from views.prospect_search import render_prospect_search_view
 from views.experimental_data_lab import render_experimental_data_lab_view
 
@@ -23,6 +24,7 @@ PAGES = [
     "Career Simulation",
     "AI Scouting Report",
     "My Scouting Notes",
+    "Manual Prospect",
     "DB Status",
 ]
 
@@ -153,6 +155,22 @@ def selected_profile():
 def selected_player():
     ctx = resolve_selected_player_context()
 
+    if st.session_state.get("selected_entity_type") == "manual_prospect":
+        manual_player = st.session_state.get("manual_player") or {}
+        return {
+            "player_id": None,
+            "name": manual_player.get("name") or "직접 입력 유망주",
+            "current_club_name": manual_player.get("club") or "-",
+            "country_of_citizenship": manual_player.get("nationality") or "-",
+            "position": manual_player.get("position") or "-",
+            "sub_position": manual_player.get("sub_position"),
+            "foot": manual_player.get("foot"),
+            "height_in_cm": None,
+            "market_value_in_eur": None,
+            "highest_market_value_in_eur": None,
+            "image_url": None,
+        }
+
     if ctx["entity_type"] == "fm_profile_only":
         profile = selected_profile()
         if profile:
@@ -257,6 +275,8 @@ def render_app_header(page_label):
 
 
 def render_dashboard():
+    if st.session_state.get("selected_entity_type") == "manual_prospect":
+        return render_dashboard_view(selected_player(), None, {"fallback_note": None}, "manual_prospect")
     ctx = resolve_selected_player_context()
     entity_type = selected_entity_type()
     player = selected_player()
@@ -268,15 +288,15 @@ def render_home():
     status = get_selected_player_status()
     feature_cards = [
         {
-            "title": "유망주 검색",
-            "description": "DB에서 분석할 유망주를 검색하고 선택합니다.",
-            "button_label": "유망주 찾기",
+            "title": "Scouting Board",
+            "description": "15~25세 기준으로 분석 가능한 유망주를 우선 검색하고 선택합니다.",
+            "button_label": "보드 열기",
             "nav_target": "유망주 검색",
         },
         {
-            "title": "통합 분석 대시보드",
-            "description": "선택한 선수의 기본 정보, 능력치, 시장가치, 출전 기록을 확인합니다.",
-            "button_label": "선수 분석 보기",
+            "title": "Player Dossier",
+            "description": "선택한 선수의 데이터 준비도, Growth Insight, Player Identity를 확인합니다.",
+            "button_label": "Dossier 보기",
             "nav_target": "유망주 통합 분석",
         },
         {
@@ -299,9 +319,15 @@ def render_home():
         },
         {
             "title": "내 스카우팅 노트",
-            "description": "직접 입력 유망주 분석, 멘토 추천, 저장된 노트를 확인합니다.",
-            "button_label": "노트 작성/조회",
+            "description": "AI 리포트, 커리어 시뮬레이션, 직접 입력 유망주 분석 등 저장된 노트를 모아봅니다.",
+            "button_label": "저장된 노트 보기",
             "nav_target": "내 스카우팅 노트",
+        },
+        {
+            "title": "직접 입력 유망주",
+            "description": "능력치를 직접 입력해 유망주를 만들고, 통합 분석/멘토 매칭/시뮬레이션/리포트 흐름을 그대로 체험합니다.",
+            "button_label": "직접 입력하기",
+            "nav_target": "직접 입력 유망주",
         },
         {
             "title": "실험실 (Data Lab)",
@@ -343,6 +369,7 @@ def main():
         "커리어 시뮬레이션": render_career_simulation,
         "AI 스카우팅 리포트": render_ai_report,
         "내 스카우팅 노트": render_my_notes,
+        "직접 입력 유망주": render_manual_prospect,
         "실험실 (Data Lab)": render_data_lab,
         "DB 상태 확인": render_db_status,
     }
@@ -355,6 +382,8 @@ def main():
 
 
 def render_career_simulation():
+    if st.session_state.get("selected_entity_type") == "manual_prospect":
+        return render_career_simulation_view(selected_player(), None, "manual_prospect")
     player = require_selected_player()
     if player is None:
         return
@@ -364,6 +393,8 @@ def render_career_simulation():
 
 
 def render_legend_matching():
+    if st.session_state.get("selected_entity_type") == "manual_prospect":
+        return render_legend_matching_view(selected_player(), None, {"fallback_note": None})
     player = require_selected_player()
     if player is None:
         return
@@ -373,6 +404,8 @@ def render_legend_matching():
 
 
 def render_ai_report():
+    if st.session_state.get("selected_entity_type") == "manual_prospect":
+        return render_ai_report_view(selected_player(), None)
     player = require_selected_player()
     if player is None:
         return
@@ -382,6 +415,10 @@ def render_ai_report():
 
 def render_my_notes():
     return render_scouting_notes_view()
+
+
+def render_manual_prospect():
+    return render_manual_prospect_view()
 
 
 if __name__ == "__main__":

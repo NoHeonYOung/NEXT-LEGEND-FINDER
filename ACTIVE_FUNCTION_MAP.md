@@ -3,6 +3,459 @@
 
 ---
 
+# v19 Phase 1~2: Scouting Board and Player Dossier redesign
+
+## 수정 파일: `services/db.py`
+
+- `search_players()` SELECT 결과에 coverage UI 판정용 읽기 컬럼을 추가했다:
+  `date_of_birth`, `highest_market_value_in_eur`, `has_style_vector`, `has_attributes`, `has_mentality`.
+- DB 스키마 변경 없이 기존 테이블 컬럼/계산식만 조회한다.
+- `analyze_only` 필터는 여전히 `views/prospect_search.py`에서 `profile_id.notna()` 후처리로 수행한다.
+
+## 수정 파일: `player_coverage.py`
+
+- v19 UI 정책에 맞춰 FM profile 없는 Transfermarkt-only 선수는 `analysis_level="limited"`로 분류한다.
+- FM profile은 있으나 style_vector 등 일부 데이터가 부족한 선수는 `partial`로 유지한다.
+- `resolve_player_age()`와 Growth/Ceiling 공식은 변경하지 않았다.
+
+## 수정 파일: `ui_components.py`
+
+- 신규 helper:
+  - `coverage_label(level)`
+  - `coverage_badge_html(level)`
+  - `format_coverage_reasons(coverage, limit=2)`
+  - `render_data_coverage_badge(coverage, entity_type=None)`
+  - `render_data_coverage_panel(player=None, profile=None, entity_type=None, title="Data Coverage Panel", expanded=False)`
+- Full / Partial / Limited / Manual badge와 Data Coverage 상세 expander를 공통 표시한다.
+- nav chip 사용자 라벨을 `Board`, `Dossier`로 정리했다. 내부 nav target은 기존 값을 유지한다.
+
+## 수정 파일: `views/prospect_search.py`
+
+- 사용자 화면 제목을 `Scouting Board`로 변경했다.
+- 기본 나이 범위를 15~25로 설정했다.
+- 기본 정책: 분석 가능한 유망주만 보기 ON, Full + Partial 우선, Limited 기본 제외.
+- `전체 DB 선수 포함`, `Limited 선수 포함`, `분석 준비도`, `FM profile 있음`, `style_vector 있음` 필터를 추가했다.
+- `analyze_only`를 끄거나 전체 DB/Limited 옵션을 켜면 Limited 선수도 표시할 수 있다.
+- 검색 결과 카드에 coverage badge, FM profile/style_vector 여부, 데이터 부족 이유, 후보 판단 문구를 표시한다.
+- Limited 선수에는 제한 분석 안내와 직접 입력 유망주 보완/재검색 CTA를 제공한다.
+
+## 수정 파일: `views/dashboard.py`
+
+- 사용자 화면 제목을 `Player Dossier`로 변경했다.
+- 상단에 공통 `Data Coverage Panel`을 추가했다.
+- FM profile 있는 선수는 `Player Identity` 섹션에서 역할/스타일/F​​M proxy 요약을 표시한다.
+- FM profile 없는 Limited 선수는 능력치/멘탈/style_vector 분석 제한 안내와 보완 CTA를 먼저 표시한다.
+- Growth Score 계산 및 session_state 공개 key는 유지한다.
+
+## 수정 파일: `test_growth_model.py`, `test_prospect_search_split.py`
+
+- v19 Scouting Board 기본 정책, Limited 표시 조건, Data Coverage helper, Player Dossier coverage panel 테스트를 추가/수정했다.
+
+# v18.3: 데이터 커버리지 gating 및 유망주 적격성 정리
+
+## 신규 파일: `player_coverage.py`
+
+- `_safe_float(value)` (내부): None/NaN → None 변환 helper.
+- `resolve_player_age(player, profile=None, reference_date=None) → float | None`:
+  나이 계산 단일 진실 공급원. 우선순위: `profile.age` → `player.date_of_birth` → None.
+  `ui_components.render_player_profile_panel`, `views/dashboard.py`, `views/career_simulation.py`에서 공통 사용.
+- `build_data_coverage(player, profile=None) → dict`:
+  `has_player`, `has_age`, `resolved_age`, `has_valuation`, `has_appearances`,
+  `has_fm_profile`, `has_style_vector`, `has_mentality`, `has_attributes`,
+  `analysis_level` ("full"/"partial"/"limited"), `missing_reasons` 반환.
+  DB/Streamlit/app.py 의존 없는 순수 함수.
+
+## 수정 파일: `ui_components.py`
+
+- `render_player_profile_panel(player, profile=None)`:
+  나이 추출을 `resolve_player_age(player, profile)` 사용으로 교체.
+  TM-only 선수(profile=None)도 DOB에서 나이 표시. None이면 "나이 데이터 부족".
+
+## 수정 파일: `views/prospect_search.py`
+
+- `_LIMITED_ANALYSIS_NOTICE` (신규 상수): FM profile 없는 선수 제한 분석 안내 문구.
+- `render_prospect_search_view`:
+  - `analyze_only = st.checkbox(..., value=True)` 기본 ON.
+  - `results["profile_id"].notna()` 후처리 필터 (DB 스키마 변경 없음).
+  - FM profile 유무에 따라 초록/회색 배지 표시.
+  - TM-only 선수에 `_LIMITED_ANALYSIS_NOTICE` caption.
+  - TM-only 선수 선택 후 `st.warning()`.
+
+## 수정 파일: `views/dashboard.py`
+
+- `build_data_coverage` / `resolve_player_age` import 추가.
+- TM-only: `st.info` → `st.warning`으로 변경, DOB 기반 나이 캡션 추가.
+- Growth Insight 섹션: ≥25세 + TM-only → 서브헤더 "현재 데이터 기반 성장 여지 분석",
+  `st.info()` 제한 분석 안내.
+- `render_page_actions` 버튼 ("분석 가능한 선수 다시 검색", "직접 입력 유망주로 보완") 추가.
+
+## 수정 파일: `views/legend_matching.py`
+
+- `build_data_coverage` import 추가.
+- `profile is None` 체크 외에 `profile.get("style_vector")` 체크 추가.
+- style_vector 없으면 `get_similar_players()` 호출 전 `missing_reasons` 표시 후 조기 반환.
+
+## 수정 파일: `views/ai_report.py`
+
+- `build_data_coverage` import 추가.
+- FM profile 없는 TM-only 선수 → `st.warning()` 제한 분석 경고.
+
+## 수정 파일: `views/career_simulation.py`
+
+- `build_data_coverage` import 추가.
+- TM-only + `resolved_age >= 25` → "현재 데이터 기반 성장 여지 분석" 제목 + `st.info()`.
+- TM-only + `resolved_age < 25` → 표준 제한 분석 안내.
+
+## 수정 파일: `test_growth_model.py`
+
+v18.3 신규 테스트 16개 추가:
+
+| 테스트명 | 검증 내용 |
+|---|---|
+| `test_build_data_coverage_transfermarkt_only_is_not_full` | TM-only → analysis_level != "full" |
+| `test_build_data_coverage_full_analysis` | 모든 데이터 있으면 "full" |
+| `test_build_data_coverage_no_fm_profile_not_eligible_for_mentor` | FM profile 없음 → mentor 불가 |
+| `test_build_data_coverage_no_style_vector_not_full` | style_vector None → "full" 아님 |
+| `test_resolve_player_age_from_profile` | profile.age 우선 반환 |
+| `test_resolve_player_age_from_dob_fallback` | DOB fallback 계산 |
+| `test_resolve_player_age_consistent_across_sources` | profile vs DOB 일관성 |
+| `test_resolve_player_age_none_when_no_data` | 데이터 없으면 None |
+| `test_prospect_search_filter_default_is_on` | analyze_only 기본 True |
+| `test_prospect_search_filter_logic_uses_profile_id_notna` | notna() 후처리 필터 |
+| `test_prospect_search_shows_limited_notice_for_tm_only` | _LIMITED_ANALYSIS_NOTICE 표시 |
+| `test_legend_matching_gates_on_style_vector` | style_vector 없으면 조기 반환 |
+| `test_manual_prospect_not_broken_by_v18_3` | manual_prospect 흐름 유지 |
+| `test_v18_3_gemini_not_broken` | Gemini 함수 import + fallback |
+| `test_v18_3_legacy_saved_note_fallback_maintained` | legacy note fallback 유지 |
+| `test_player_coverage_has_no_ui_or_db_dependency` | player_coverage.py 순수성 |
+
+---
+
+# v18.2: Gemini API runtime integration QA
+
+## 수정 파일: `gemini_client.py`
+
+- `_is_gemini_sdk_installed()` (신규): `google.genai` → `google.generativeai` 순으로 import 가능 여부 확인. 하나라도 있으면 True.
+- `is_gemini_available()`: 기존과 동일 시그니처. 내부에서 `_is_gemini_sdk_installed()` 사용.
+- `get_gemini_sdk_unavailable_reason()` (신규): None/`"no_api_key"`/`"sdk_not_installed"` 반환.
+- `generate_gemini_content()`: 신규 SDK(`from google import genai`) 먼저 시도, ImportError 시 구 SDK(`import google.generativeai`) fallback. 두 SDK 모두 없으면 `pip install -U google-genai` 안내 포함 오류 반환.
+
+SDK 우선순위: `google-genai` (신규) → `google-generativeai` (구, fallback)
+
+## 수정 파일: `views/ai_report.py`
+
+- `_SAVE_EXCLUDE_FALLBACK_REASONS` (신규 상수): `("no_text_input", "no_api_key", "api_error", "parse_failed")` — 저장 payload에서 제외할 fallback reason 목록.
+- `_SDK_NOT_INSTALLED_GUIDANCE` (신규 상수): SDK 미설치 시 `st.warning`으로 표시할 안내 메시지.
+- `_augment_sections_with_qualitative`: `has_signals`/`has_advisory` 체크 수정 — 기존 `not in (..., None)` 버그 제거. 성공 신호(`_fallback_reason` 없음)가 이제 정상적으로 리포트에 포함된다.
+- `_render_qualitative_section`: `get_gemini_sdk_unavailable_reason()` 호출 추가. SDK 미설치 시 `st.warning(_SDK_NOT_INSTALLED_GUIDANCE)`, key 없음 시 기존 `st.info(_GEMINI_API_KEY_GUIDANCE)`.
+- 저장 섹션: `_SAVE_EXCLUDE_FALLBACK_REASONS` 상수로 api_error 포함 필터링. api_error 시 `qual_evidence = None` → `report_generation_mode = "rule_based"` 보장.
+
+## 수정 파일: `requirements.txt`
+
+- `google-genai` 추가.
+
+## 수정 파일: `test_growth_model.py`
+
+v18.2 신규 테스트 8개 추가:
+- `test_augment_sections_no_longer_blocks_successful_signals`: `has_signals` 체크에서 None 제거 확인
+- `test_save_exclude_fallback_reasons_includes_api_error`: `_SAVE_EXCLUDE_FALLBACK_REASONS` 상수 확인
+- `test_api_error_payload_does_not_set_rule_based_with_gemini`: api_error → rule_based 모드 유지 검증
+- `test_gemini_sdk_unavailable_reason_returns_valid_value`: 신규 함수 반환값 검증
+- `test_gemini_client_has_sdk_install_guidance`: 설치 안내 문자열 확인
+- `test_render_qualitative_section_has_sdk_not_installed_guidance`: SDK 미설치 UI 분기 확인
+- `test_gemini_client_supports_both_sdk_imports`: 신/구 SDK 분기 소스 확인
+- `test_qualitative_evidence_safe_parse_markdown_code_block`: 다양한 markdown code block 파싱 검증
+
+---
+
+# v18.1: Gemini runtime QA and user guidance
+
+## 수정 파일: `views/ai_report.py`
+
+- `_QUALITATIVE_EXAMPLE_TEXTS` (신규 상수): 정성 텍스트 입력 예시 3종 (경기 관찰 메모 / 스카우팅 리포트 / 감독 인터뷰).
+- `_GEMINI_API_KEY_GUIDANCE` (신규 상수): API key 미설정 시 표시할 안내 메시지. key 이름(`GEMINI_API_KEY`, `GOOGLE_API_KEY`)과 설정 위치를 포함.
+- `_render_qualitative_section`: API key 없을 때 `st.caption` → `st.info(_GEMINI_API_KEY_GUIDANCE)`로 교체. "테스트용 정성 텍스트 입력 예시" expander 추가 (텍스트 입력란 앞).
+
+## 수정 파일: `test_growth_model.py`
+
+- `test_qualitative_section_has_example_texts_expander` (신규): `_render_qualitative_section` 소스에 "테스트용 정성 텍스트 입력 예시" 포함 여부 검증.
+- `test_qualitative_api_key_guidance_mentions_key_name` (신규): `views/ai_report` 소스에 `GEMINI_API_KEY`와 `_GEMINI_API_KEY_GUIDANCE` 포함 여부 검증.
+
+API key 이름 (코드 기준): `GEMINI_API_KEY` / `GOOGLE_API_KEY` (`.streamlit/secrets.toml` 또는 환경변수, `gemini_client.get_gemini_api_key()` 탐색 순서)
+
+---
+
+# v18: Qualitative Evidence + Gemini Advisory Report
+
+## 신규 파일: `services/qualitative_evidence.py`
+
+Gemini의 두 가지 역할만 수행하는 서비스 모듈. DB/app.py/Streamlit UI를 import하지 않는다.
+Gemini = 문장 미화 도구 X. Gemini = 정성 신호 추출 + 근거 기반 보조 추천 O.
+
+- `make_fallback_signals(reason)`: API key 없음/호출 실패/텍스트 없음 시 기본 정성 신호 dict 반환.
+- `make_fallback_advisory(reason)`: API key 없음/호출 실패 시 기본 보조 추천 dict 반환.
+- `_build_extraction_prompt(text_input, player_context)`: 정성 신호 추출용 Gemini 프롬프트 생성.
+- `_build_advisory_prompt(player_context, quantitative_summary, qualitative_signals)`: 보조 추천용 Gemini 프롬프트 생성.
+- `_safe_parse_json(text)`: Gemini 응답에서 JSON을 안전하게 파싱. 실패하면 None 반환.
+- `_validate_signals(parsed)`: 파싱된 signals dict 검증/정규화. 누락 키는 기본값으로 채움.
+- `_validate_advisory(parsed)`: 파싱된 advisory dict 검증/정규화.
+- `extract_qualitative_signals(text_input, player_context)`: 텍스트 없음→no_text_input fallback, API key 없음→no_api_key fallback, 호출 실패→api_error fallback. 반환: `(signals_dict, error|None)`.
+- `generate_gemini_advisory(player_context, quantitative_summary, qualitative_signals)`: 반환: `(advisory_dict, error|None)`.
+- `build_player_context_for_gemini(player, profile, growth_insight, growth_explanation, mentor_summary)`: Gemini 프롬프트용 선수 context dict 생성.
+- `build_quantitative_summary_for_gemini(growth_insight, growth_explanation, ...)`: Gemini 프롬프트용 정량 분석 요약 dict 생성.
+- `build_qualitative_evidence_payload(text_input, signals)`: 저장용 qualitative_evidence payload 생성 (원문 500자 truncate, _fallback_reason 제거).
+
+API key는 기존 `gemini_client.py`의 `get_gemini_api_key()` / `is_gemini_available()`을 재사용한다.
+
+## 추출 JSON 구조
+
+```json
+{
+  "qualitative_summary": "",
+  "playing_time_signal": "positive | neutral | negative | unknown",
+  "injury_risk_signal": "positive | neutral | negative | unknown",
+  "coach_trust_signal": "positive | neutral | negative | unknown",
+  "development_signal": "positive | neutral | negative | unknown",
+  "transfer_rumor_signal": "high | medium | low | unknown",
+  "mentality_signal": "positive | neutral | negative | unknown",
+  "strength_mentions": [],
+  "weakness_mentions": [],
+  "risk_mentions": [],
+  "recommended_focus": [],
+  "evidence_quotes": [],
+  "confidence": "high | medium | low"
+}
+```
+
+## advisory JSON 구조
+
+```json
+{
+  "advisory_summary": "",
+  "player_fit_assessment": "",
+  "training_recommendations": [],
+  "career_recommendations": [],
+  "risk_management": [],
+  "mentor_usage_recommendations": [],
+  "what_to_monitor_next": [],
+  "unsupported_or_unknown": [],
+  "final_scouting_comment": "",
+  "confidence": "high | medium | low"
+}
+```
+
+## 수정된 파일
+
+### `scouting_note_payload.py`
+
+- `_build_env_settings`: `qualitative_evidence_source`와 `report_generation_mode` 추가 (기존 키 유지).
+- `_build_simulation_result`: `qualitative_evidence`와 `gemini_advisory` 추가 (기존 키 유지).
+- `_build_note_payload`: `qualitative_evidence=None`, `gemini_advisory=None` 키워드 인자 추가. has_gemini 여부로 `report_generation_mode` 자동 결정 ("rule_based" | "rule_based_with_gemini").
+- `extract_structured_note_result`: `qualitative_evidence`와 `gemini_advisory` 복원 추가. legacy note는 빈 dict {}로 fallback.
+- 공개 함수(`build_ai_report_note_payload`, `build_career_simulation_note_payload`, `build_manual_note_payload`)는 `**kwargs`를 통해 새 필드를 투명하게 전달. 기존 호출부 수정 불필요.
+
+### `views/ai_report.py`
+
+- import 추가: `services.qualitative_evidence`의 주요 helper 6종.
+- `_render_qualitative_section(player, profile, growth_insight, growth_explanation, env_settings, simulation_result)` (신규): 정성 텍스트 입력 UI, 신호 추출 버튼, 보조 추천 버튼, 결과 표시.
+- `_render_qualitative_results()` (신규): 추출된 정성 신호 시각화 (signal badge, 강점/약점/리스크 목록, 근거 문장, confidence).
+- `_render_advisory_results()` (신규): Gemini 보조 추천 표시 (훈련/커리어/리스크/멘토/확인 필요/근거 부족).
+- `_augment_sections_with_qualitative(sections)` (신규): 정성 신호와 보조 추천이 있으면 리포트 섹션에 "정성 텍스트 근거"와 "Gemini 보조 스카우팅 추천" 섹션을 추가. 기존 점수와 리포트 구조는 변경하지 않는다.
+- `render_ai_report_view`: `_render_qualitative_section` 호출 추가. 저장 payload에 qualitative_evidence와 gemini_advisory 포함.
+- session_state: `qualitative_text_input`, `qualitative_signals`, `gemini_advisory` 추가.
+
+### `views/prospect_search.py`
+
+- 새 선수 선택 시 `qualitative_text_input`, `qualitative_signals`, `gemini_advisory`를 함께 pop.
+
+### `AGENTS.md`
+
+- v18 Gemini 역할 정의, Qualitative Evidence Invariants 추가.
+- v18 허용 표현 업데이트.
+
+### `test_growth_model.py`
+
+- v18 테스트 16개 추가 (실제 Gemini API 호출 없음, API key 없는 환경에서 전부 통과):
+  1. `test_qualitative_evidence_importable_without_api_key`
+  2. `test_qualitative_evidence_fallback_without_api_key`
+  3. `test_qualitative_evidence_fallback_with_no_text`
+  4. `test_qualitative_evidence_safe_json_parsing`
+  5. `test_qualitative_evidence_bad_json_does_not_crash`
+  6. `test_qualitative_signals_json_serializable`
+  7. `test_gemini_advisory_json_serializable`
+  8. `test_qualitative_evidence_payload_json_serializable`
+  9. `test_scouting_note_payload_includes_qualitative_fields`
+  10. `test_scouting_note_payload_without_qualitative_fields`
+  11. `test_extract_structured_note_result_includes_qualitative`
+  12. `test_legacy_note_fallback_maintained_with_qualitative_fields`
+  13. `test_ai_report_view_has_qualitative_section`
+  14. `test_qualitative_evidence_service_has_no_ui_or_db_dependency`
+  15. `test_manual_prospect_flow_not_broken_by_v18`
+
+## 저장 payload 구조 추가분
+
+`simulation_result` 안:
+```json
+{
+  "qualitative_evidence": {
+    "source": "manual_text_input",
+    "input_text_snapshot": "...",
+    "extracted_signals": {...},
+    "created_at": "..."
+  },
+  "gemini_advisory": {
+    "advisory_summary": "...",
+    "training_recommendations": [],
+    "career_recommendations": [],
+    "risk_management": [],
+    "mentor_usage_recommendations": [],
+    "confidence": "medium"
+  }
+}
+```
+
+`env_settings` 안:
+```json
+{
+  "qualitative_evidence_source": "manual_text_input | none",
+  "report_generation_mode": "rule_based | rule_based_with_gemini"
+}
+```
+
+## 향후 확장 포인트 (미구현)
+
+- CSV 업로드로 기사 묶음 분석
+- RSS/뉴스 API 연동
+- 크롤링 기반 자동 정성 신호 수집
+- 복수 기사 종합 분석
+
+---
+
+# v17.1: Data provenance and labeling cleanup
+
+코드 기능 변경 없음 — 화면 표현과 문서를 실제 데이터 출처에 맞게 정리했다.
+
+## 변경된 UI 상수/텍스트
+
+- `views/ai_report.py::sections_to_report_text`: 헤더 `"AI 스카우팅 리포트 초안"` →
+  `"분석 리포트 초안 (규칙 기반)"`
+- `views/ai_report.py::_PROVENANCE_TEXT`, `_PROVENANCE_TABLE` (신규 모듈 상수):
+  데이터 출처 6항목 표 (DB/FM proxy/rule-based/정성 없음/Gemini 미사용).
+- `views/ai_report.py::render_ai_report_view`:
+  - 타이틀 `"AI 스카우팅 리포트 초안"` → `"스카우팅 분석 리포트 초안"`
+  - 타이틀 직후 `분석 근거 안내` expander 추가
+  - 저장 버튼 라벨 `"이 AI 리포트를 My Scouting Notes에 저장"` →
+    `"이 분석 리포트를 My Scouting Notes에 저장"`
+  - 저장 성공 메시지 `"AI 리포트가 스카우팅 노트에 저장되었습니다."` →
+    `"분석 리포트(규칙 기반)가 스카우팅 노트에 저장되었습니다."`
+- `views/dashboard.py::_PROVENANCE_TEXT`, `_PROVENANCE_TABLE` (신규 모듈 상수)
+- `views/dashboard.py::render_dashboard_view`:
+  - 타이틀 직후 `분석 근거 안내` expander 추가
+  - `멘탈리티 분석` subheader → `FM 기반 멘탈 지표 (proxy)` subheader
+  - 멘탈 info 텍스트에 "FM mental attributes 기반 대체 지표" 명시
+- `views/career_simulation.py::_PROVENANCE_TEXT`, `_PROVENANCE_TABLE` (신규 모듈 상수)
+- `views/career_simulation.py::render_career_simulation_view`:
+  - 타이틀 직후 `분석 근거 안내` expander 추가
+  - 하단 nav 버튼 라벨 `"📄 AI 스카우팅 리포트 생성"` → `"📄 분석 리포트 초안 생성"`
+- `views/legend_matching.py::render_mentor_guide`:
+  - `"E. AI 리포트로 넘기기"` → `"E. 분석 리포트 초안으로 넘기기"`
+  - `"AI 스카우팅 리포트 초안에 반영"` → `"스카우팅 분석 리포트 초안에 반영"`
+- `views/scouting_notes.py::_PROVENANCE_TABLE` (신규 모듈 상수)
+- `views/scouting_notes.py::render_scouting_notes_view`:
+  - info 텍스트 `"AI 리포트"` → `"분석 리포트 초안"` 수정
+  - `분석 근거 안내` expander 추가 (info 아래)
+- `test_growth_model.py`: `"이 AI 리포트를 My Scouting Notes에 저장"` 검사 문자열 2곳을
+  `"이 분석 리포트를 My Scouting Notes에 저장"`으로 업데이트
+
+## 변경하지 않은 항목
+
+- 페이지 네비게이션 target 이름 (`"AI 스카우팅 리포트"`) — app.py 메뉴 key 변경 없음
+- Growth/Ceiling Model 공식, session_state key, JSONB payload 구조
+- DB 스키마, `insert_scouting_note()` 시그니처
+- `views/manual_prospect.py` — 이미 "실제 Gemini API 호출은 없으며, 입력값과 FM 기반 proxy
+  능력치를 연결한 prototype 분석"을 명시하고 있어 추가 수정 불필요
+
+## 향후 v18 확장 포인트 (미구현)
+
+- 뉴스/스카우팅 텍스트 입력 → `evidence_extractor.py` 정성 신호 추출 → "정성 텍스트 근거" 표시
+- Gemini API 연동 시 `gemini_ready_payload`를 그대로 전달해 자연어 리포트 생성
+- 정성 텍스트 근거가 없으면 "정성 텍스트 근거: 입력 없음"으로 계속 표시
+
+---
+
+# v17: Manual Prospect workflow separation and mentor age filter
+
+- `views/manual_prospect.py::render_manual_prospect_view` (신규): "직접 입력 유망주" 생성
+  폼 + 생성 후 미리보기(Manual Growth Score, 유사 멘토 후보). 제출 시
+  `selected_entity_type="manual_prospect"`, `manual_player`/`manual_attributes`/
+  `manual_career_settings`, `growth_insight`/`growth_explanation`(ceiling 없음)을 저장한다.
+- `manual_prospect_helpers.py` (신규):
+  - `safe_text`, `get_career_settings`, `normalize_env_settings`, `setting_summary`,
+    `manual_similarity_candidates`, `build_manual_analysis`: `views/scouting_notes.py`에서
+    이동(로직 동일).
+  - `manual_player_profile_panel_inputs(manual_player)`: 직접 입력 데이터를
+    `render_player_profile_panel`용 `(player, profile)` dict로 변환.
+  - `filter_mentor_candidates_by_age(candidates, target_age, age_key="age",
+    exclude_ids=None, id_key="profile_id", min_results=3)`: 멘토 후보 나이 필터
+    (1차 `max(28, target_age+5)`, 완화 `max(26, target_age+3)`, 자기 자신/나이 없음/0세 제외,
+    `(filtered_candidates, used_fallback)` 반환).
+  - `STALE_SELECTION_KEYS`: 새 직접 입력 유망주 생성 시 함께 초기화하는 멘토/시뮬레이션/리포트/
+    growth/ceiling session_state key 목록.
+- `views/scouting_notes.py::render_scouting_notes_view`: "저장 노트 조회" 전용 화면으로
+  축소. `custom_note_form`/`build_manual_analysis` 호출/미리보기 블록을 모두 제거하고,
+  상단에 "직접 입력 유망주"·"유망주 검색" 이동 버튼을 추가했다. `ENTITY_TYPE_LABELS`에
+  `"manual_prospect": "직접 입력 유망주"` 추가.
+- `views/dashboard.py::render_dashboard_view`: `entity_type == "manual_prospect"` 분기
+  추가 — `manual_player_profile_panel_inputs` + `build_manual_growth_insight` 기반
+  "Growth Insight (직접 입력 데이터 기반)" 섹션을 표시하고 `growth_insight`/
+  `growth_explanation`만 갱신한 뒤 early return.
+- `views/career_simulation.py::render_career_simulation_view`: `entity_type ==
+  "manual_prospect"` 분기 추가 — `build_manual_growth_insight` → `apply_ceiling_adjustment`
+  로 "1. Manual Growth Baseline" / "2. 코칭 시나리오 리포트" / "3. Final Growth Score" 3단
+  섹션을 렌더링하고 `ceiling_growth_context = {"entity_type": "manual_prospect",
+  "player_id": None, "profile_id": None, "source": "career_simulation"}`을 저장. 저장 버튼은
+  `build_manual_note_payload(entity_type="manual_prospect", ...)` 사용.
+- `views/legend_matching.py::render_manual_prospect_mentors` (신규): 직접 입력 유망주용
+  `manual_similarity_candidates` + `filter_mentor_candidates_by_age` 결과를 카드로 표시하고
+  멘토 선택 시 `selected_mentor_profile_id`/`selected_mentor_name`/`mentor_summary`를 저장.
+- `views/legend_matching.py::render_legend_matching_view`: 실제 DB 선수의
+  `get_similar_players` 결과에도 `filter_mentor_candidates_by_age(..., exclude_ids=
+  [profile.get("profile_id")])`를 적용하고, `used_fallback`이면 "조건을 완화해 표시한
+  후보입니다." 안내를 표시. manual_prospect이면 `render_manual_prospect_mentors`로 위임.
+- `views/ai_report.py::is_ceiling_context_current`: `entity_type in ("manual_note",
+  "manual_prospect")`일 때 `context.get("entity_type") == entity_type`만으로 일치 판단.
+  manual_prospect 저장은 `build_manual_note_payload(entity_type="manual_prospect", player=
+  manual_player, profile=None, ...)` → `insert_scouting_note(player_id=None, profile_id=None,
+  ...)`.
+- `app.py`: `render_manual_prospect()`(신규 wrapper), `PAGES`에 `"Manual Prospect"`, 메뉴
+  dict에 `"직접 입력 유망주"`, `render_home()` feature card 추가. `selected_player()`는
+  `selected_entity_type == "manual_prospect"`일 때 `manual_player` 기반 player dict를
+  합성(`player_id=None`)해 반환. `render_dashboard`/`render_career_simulation`/
+  `render_legend_matching`/`render_ai_report`는 manual_prospect 분기에서
+  `require_selected_player()` 없이 `selected_player()`를 직접 사용.
+- `state.py::build_selected_player_status`: `selected_entity_type == "manual_prospect"`이고
+  `player is not None`이면 `entity_type`을 `"manual_prospect"`로 덮어써 헤더 배지 표시.
+  `ENTITY_TYPE_LABELS`/`DATA_MODE_BADGE_CLASS`에 `"manual_prospect"` 항목 추가.
+- `views/prospect_search.py`: 다른 실제 선수 선택 시 `manual_player`/`manual_attributes`/
+  `manual_career_settings`도 함께 pop.
+- `ui_components.py`: `NAV_TARGETS`/`NAV_CHIP_LABELS`에 `"직접 입력 유망주"`("Manual") 추가.
+
+---
+
+# v16.2: Saved note display polish
+
+- `views/scouting_notes.py::saved_coaching_sections`: 저장된 구조화 코칭 결과를 사용자 표시 순서인
+  종합 평가, 훈련 방향, 기대 장점, 소홀 리스크, 위험 경고, 커리어 전략으로 정리한다.
+- `views/scouting_notes.py::saved_report_original`: 기존 `gemini_report` 원문을 우선 사용하고,
+  없으면 구조화 `generated_report_text`로 fallback한다.
+- `views/scouting_notes.py::render_scouting_notes_view`: 저장 노트 카드 다음에 Growth/Final Growth/부상
+  metric과 코칭 리포트를 기본 표시한다. 기존 템플릿 원문과 개발자용 payload는 각각 expander로 분리한다.
+- `NOTE_TYPE_LABELS`/`SOURCE_LABELS`: Gemini 미사용 저장 결과를 `규칙 기반 리포트`로 표시한다.
+- 구조화 코칭이 없는 legacy note는 기존 summary/strengths/weaknesses 표시 흐름을 유지한다.
+- 선택된 멘토가 없으면 별도 멘토 섹션을 표시하지 않는다.
+
+---
+
 # v16.1: Persistence QA and saved-note UI polish
 
 - `scouting_note_payload.py::json_safe`: datetime/tuple/numpy·pandas scalar/NaN/NA 변환을 보장한다.

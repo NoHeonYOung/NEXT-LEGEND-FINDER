@@ -61,20 +61,21 @@ def test_matched_player_full_flow():
     assert not at.exception
 
 
-def test_manual_note_submission():
+def test_manual_prospect_submission():
     at = AppTest.from_file("app.py")
-    at.session_state["nav_page"] = "내 스카우팅 노트"
+    at.session_state["nav_page"] = "직접 입력 유망주"
     at.run(timeout=30)
     assert not at.exception
 
     name_inputs = [t for t in at.text_input if "이름" in (t.label or "")]
     assert name_inputs, "유망주 이름 입력 필드를 찾을 수 없습니다."
-    name_inputs[0].set_value("Custom Prospect A").run(timeout=30)
+    name_inputs[0].set_value("Custom Prospect A")
 
-    submit_buttons = [b for b in at.button if "생성" in (b.label or "") or "제출" in (b.label or "")]
+    submit_buttons = [b for b in at.button if "생성" in (b.label or "")]
     assert submit_buttons, "제출 버튼을 찾을 수 없습니다."
     submit_buttons[0].click().run(timeout=30)
     assert not at.exception
+    assert at.session_state["selected_entity_type"] == "manual_prospect"
 
 
 if __name__ == "__main__":
@@ -84,5 +85,5 @@ if __name__ == "__main__":
     print("test_vinicius_dashboard_and_legend_matching OK")
     test_matched_player_full_flow()
     print("test_matched_player_full_flow OK")
-    test_manual_note_submission()
-    print("test_manual_note_submission OK")
+    test_manual_prospect_submission()
+    print("test_manual_prospect_submission OK")

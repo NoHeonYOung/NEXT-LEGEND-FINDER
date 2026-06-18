@@ -11,10 +11,29 @@ from analysis_helpers import (
     simulation_comment,
 )
 from explanation_engine import build_growth_explanation
-from growth_model import FEATURE_LABELS, apply_ceiling_adjustment, build_growth_insight
-from scouting_note_payload import build_career_simulation_note_payload
+from growth_model import FEATURE_LABELS, apply_ceiling_adjustment, build_growth_insight, build_manual_growth_insight
+from manual_prospect_helpers import manual_player_profile_panel_inputs
+from player_coverage import build_data_coverage
+from scouting_note_payload import build_career_simulation_note_payload, build_manual_note_payload
 from services.db import get_appearances, get_valuations, insert_scouting_note
 from ui_components import render_page_actions, render_player_profile_panel
+
+
+_PROVENANCE_TEXT = (
+    "현재 분석은 DB에 저장된 선수 기본 정보, 시장가치/출전 기록, "
+    "FM 기반 능력치 및 멘탈 속성 proxy, Growth/Ceiling 규칙 모델을 바탕으로 생성되었습니다. "
+    "뉴스 기사, 감독 인터뷰, 스카우팅 텍스트 기반 정성 분석은 아직 입력되지 않았습니다."
+)
+
+_PROVENANCE_TABLE = """| 항목 | 출처 |
+|---|---|
+| 선수 기본 정보 | DB |
+| 시장가치/출전 기록 | DB |
+| 능력치/멘탈 속성 | FM proxy profile |
+| 성장 점수 | rule-based Growth/Ceiling Model |
+| 정성 텍스트 근거 | 입력 없음 |
+| Gemini 분석 | 미사용 |
+"""
 
 
 def render_career_simulation_view(player, profile, entity_type=None):
@@ -22,7 +41,15 @@ def render_career_simulation_view(player, profile, entity_type=None):
     선택 선수/프로필(require_selected_player/get_player_profile)을 조회한 뒤
     이 함수에 전달한다 (선택 로직은 app.py에 그대로 유지)."""
     st.title("커리어 시뮬레이션 프로토타입")
-    render_player_profile_panel(player, profile)
+    with st.expander("분석 근거 안내"):
+        st.caption(_PROVENANCE_TEXT)
+        st.markdown(_PROVENANCE_TABLE)
+    manual_player = st.session_state.get("manual_player") if entity_type == "manual_prospect" else None
+    if manual_player:
+        panel_player, panel_profile = manual_player_profile_panel_inputs(manual_player)
+        render_player_profile_panel(panel_player, panel_profile)
+    else:
+        render_player_profile_panel(player, profile)
     left, right = st.columns([1, 1.2])
     with left:
         st.subheader("시나리오 설정")
@@ -77,6 +104,22 @@ def render_career_simulation_view(player, profile, entity_type=None):
 
     st.subheader("데이터 타입에 따른 해석 제한 안내")
     st.markdown(f'<div class="warning-note">{breakdown["limitation_note"]}</div>', unsafe_allow_html=True)
+
+    # FM profile 없는 선수에 대한 제한 분석 안내
+    if entity_type == "transfermarkt_only":
+        coverage = build_data_coverage(player, profile)
+        resolved_age = coverage["resolved_age"]
+        is_old_player = resolved_age is not None and resolved_age >= 25
+        if is_old_player:
+            st.info(
+                "이 분석은 Transfermarkt 기반 제한 분석입니다 (현재 데이터 기반 성장 여지 분석). "
+                "FM profile이 없어 FM 능력치, 멘탈 지표, style_vector 기반 판단은 제외되었습니다."
+            )
+        else:
+            st.info(
+                "이 분석은 Transfermarkt 기반 제한 분석입니다. "
+                "FM profile이 없어 FM 능력치, 멘탈 지표, style_vector 기반 판단은 제외되었습니다."
+            )
 
     has_player_id = isinstance(player, dict) and player.get("player_id") is not None
     if has_player_id and entity_type != "manual_note":
@@ -229,6 +272,123 @@ def render_career_simulation_view(player, profile, entity_type=None):
                 st.error("시뮬레이션 결과 저장 중 오류가 발생했습니다.")
                 with st.expander("개발 확인용 오류"):
                     st.exception(exc)
+    elif entity_type == "manual_prospect" and manual_player:
+        manual_attributes = st.session_state.get("manual_attributes") or {}
+        manual_career_settings = st.session_state.get("manual_career_settings") or {}
+
+        st.caption("위 시뮬레이션은 입력 조건을 비교하기 위한 프로토타입입니다. 아래에서는 직접 입력한 능력치와 현재 선택한 훈련·출전·커리어 환경을 함께 반영한 성장 전망을 확인할 수 있습니다.")
+
+        growth_insight = build_manual_growth_insight(manual_player, manual_attributes, manual_career_settings)
+        growth_insight = apply_ceiling_adjustment(growth_insight, env_settings)
+        growth_explanation = build_growth_explanation(
+            growth_insight,
+            player_context={"name": manual_player.get("name"), "position": manual_player.get("position")},
+        )
+        st.session_state["growth_insight"] = growth_insight
+        st.session_state["growth_explanation"] = growth_explanation
+        st.session_state["ceiling_growth_insight"] = growth_insight
+        st.session_state["ceiling_growth_explanation"] = growth_explanation
+        st.session_state["ceiling_growth_context"] = {
+            "entity_type": "manual_prospect",
+            "player_id": None,
+            "profile_id": None,
+            "source": "career_simulation",
+        }
+
+        ceiling_model = growth_insight.get("ceiling_model", {})
+        ceiling_explanation = growth_explanation.get("ceiling_explanation") or {}
+
+        manual_score = growth_insight["growth_score"]
+        proto_score = simulation_result["prototype_growth_score"]
+        final_score = ceiling_model.get("final_growth_score")
+        adjustment = ceiling_model.get("scenario_adjustment", 0)
+
+        # 1) Manual Growth Baseline
+        st.subheader("1. Manual Growth Baseline (직접 입력 데이터 기반)")
+        st.markdown('<div class="section-note">이 유망주의 기본 성장 점수는 직접 입력한 능력치와 환경 설정을 바탕으로 계산되었습니다.</div>', unsafe_allow_html=True)
+
+        b1, b2 = st.columns(2)
+        b1.metric("프로토타입 성장 점수", proto_score)
+        b2.metric("Manual Growth Baseline", f"{manual_score:.1f}")
+
+        st.markdown(f"<div class='section-note'>{growth_explanation['summary']}</div>", unsafe_allow_html=True)
+
+        st.divider()
+
+        # 2) Coaching Scenario Report
+        st.subheader("2. 코칭 시나리오 리포트")
+        st.markdown("<div class='scout-panel'><b>시나리오 총평</b><br>" + ceiling_explanation.get("coaching_summary", "") + "</div>", unsafe_allow_html=True)
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("<div class='scout-panel'><b>추천 훈련 방향</b><br>" + "<br>".join(f"• {item}" for item in ceiling_explanation.get("training_directions", [])) + "</div>", unsafe_allow_html=True)
+            st.markdown("<div class='scout-panel'><b>소홀히 했을 때의 단점</b><br>" + "<br>".join(f"• {item}" for item in ceiling_explanation.get("neglect_risks", [])) + "</div>", unsafe_allow_html=True)
+        with c2:
+            st.markdown("<div class='scout-panel'><b>기대 장점</b><br>" + "<br>".join(f"• {item}" for item in ceiling_explanation.get("expected_benefits", [])) + "</div>", unsafe_allow_html=True)
+            st.markdown("<div class='scout-panel'><b>리스크 경고</b><br>" + "<br>".join(f"• {item}" for item in ceiling_explanation.get("risk_warnings", [])) + "</div>", unsafe_allow_html=True)
+        st.markdown("<div class='scout-panel'><b>추천 커리어 전략</b><br>" + "<br>".join(f"• {item}" for item in ceiling_explanation.get("career_strategy", [])) + "</div>", unsafe_allow_html=True)
+
+        with st.expander("상세 계산 근거"):
+            st.caption(f"공식: {ceiling_model.get('formula', '')}")
+            st.caption(f"시나리오: {ceiling_model.get('scenario_label', '-')}")
+            v1, v2, v3, v4, v5 = st.columns(5)
+            v1.metric("α (출전 기회)", ceiling_model.get("alpha"))
+            v2.metric("γ (리그 난이도)", ceiling_model.get("gamma"))
+            v3.metric("β (리스크)", ceiling_model.get("beta"))
+            v4.metric("훈련 배수", ceiling_model.get("training_multiplier"))
+            v5.metric("Δleague", ceiling_model.get("delta_league"))
+            st.caption(f"Ceiling Scenario Adjustment: {adjustment:+.1f}점")
+            for line in ceiling_explanation.get("variable_explanations", []):
+                st.markdown(f"<div class='section-note'>{line}</div>", unsafe_allow_html=True)
+
+        st.divider()
+
+        # 3) Final Growth Score
+        st.subheader("3. Final Growth Score")
+        if final_score is None:
+            st.metric("Final Growth Score", "산정 불가")
+        else:
+            st.metric("Final Growth Score", f"{final_score:.1f} / 100")
+            st.progress(int(round(final_score)))
+            st.caption("직접 입력한 기본 성장 평가에 현재 시나리오의 기회와 위험을 반영한 prototype 결과입니다.")
+
+        if st.button("현재 시뮬레이션 결과를 스카우팅 노트에 저장"):
+            try:
+                report_sections = {
+                    "Growth Model Insight": growth_explanation.get("summary", ""),
+                    "Ceiling Scenario Insight": ceiling_explanation.get("coaching_summary", ""),
+                }
+                report_text = "\n\n".join(
+                    f"{title}\n{body}" for title, body in report_sections.items() if body
+                )
+                payload = build_manual_note_payload(
+                    entity_type="manual_prospect",
+                    player=manual_player,
+                    profile=None,
+                    env_settings=env_settings,
+                    simulation_result=simulation_result,
+                    growth_insight=growth_insight,
+                    growth_explanation=growth_explanation,
+                    ceiling_growth_insight=st.session_state.get("ceiling_growth_insight"),
+                    ceiling_growth_explanation=st.session_state.get("ceiling_growth_explanation"),
+                    ceiling_growth_context=st.session_state.get("ceiling_growth_context"),
+                    report_sections=report_sections,
+                    report_text=report_text,
+                )
+                saved = insert_scouting_note(
+                    player_id=None,
+                    profile_id=None,
+                    env_settings=payload["env_settings"],
+                    simulation_result=payload["simulation_result"],
+                    report=payload["report"],
+                )
+                st.success(
+                    f"현재 시뮬레이션 결과가 스카우팅 노트에 저장되었습니다. "
+                    f"My Scouting Notes에서 다시 확인할 수 있습니다. note_id: {saved['note_id']}"
+                )
+            except Exception as exc:
+                st.error("시뮬레이션 결과 저장 중 오류가 발생했습니다.")
+                with st.expander("개발 확인용 오류"):
+                    st.exception(exc)
     else:
         st.info("Real Data Growth Baseline은 Transfermarkt/FM 데이터와 매칭된 선수에서만 표시됩니다. (직접 입력 노트는 prototype 점수만 제공됩니다.)")
 
@@ -236,6 +396,6 @@ def render_career_simulation_view(player, profile, entity_type=None):
         st.json({"env_settings": env_settings, "simulation_result": simulation_result, "breakdown": breakdown})
 
     render_page_actions([
-        ("📄 AI 스카우팅 리포트 생성", "AI 스카우팅 리포트", "primary"),
+        ("📄 분석 리포트 초안 생성", "AI 스카우팅 리포트", "primary"),
         ("📝 My Scouting Notes에 저장", "내 스카우팅 노트"),
     ])

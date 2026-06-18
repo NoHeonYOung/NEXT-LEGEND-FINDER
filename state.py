@@ -14,6 +14,7 @@ ENTITY_TYPE_LABELS = {
     "fm_profile_only": "FM 프로필 기반 후보",
     "transfermarkt_only": "Transfermarkt 기반 후보",
     "manual_note": "직접 입력 기반 분석",
+    "manual_prospect": "직접 입력 유망주",
     None: "선택 선수 없음",
 }
 
@@ -22,6 +23,7 @@ DATA_MODE_BADGE_CLASS = {
     "fm_profile_only": "data-mode-badge data-mode-fm",
     "transfermarkt_only": "data-mode-badge data-mode-tm",
     "manual_note": "data-mode-badge data-mode-manual",
+    "manual_prospect": "data-mode-badge data-mode-manual",
     None: "data-mode-badge data-mode-none",
 }
 
@@ -32,6 +34,9 @@ def build_selected_player_status(player, entity_type):
     player/entity_type은 app.py의 selected_player()/selected_entity_type()
     판정 결과를 그대로 전달받는다(판정 로직 자체는 변경하지 않음).
     """
+    if player is not None and st.session_state.get("selected_entity_type") == "manual_prospect":
+        entity_type = "manual_prospect"
+
     if player is None:
         manual_title = st.session_state.get("selected_manual_note_title")
         if st.session_state.get("selected_entity_type") == "manual_note" and manual_title:

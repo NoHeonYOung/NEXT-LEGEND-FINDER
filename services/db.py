@@ -150,8 +150,13 @@ def search_players(keyword="", position="", nationality="", club="", max_age=23)
             p.country_of_citizenship,
             p.position,
             p.sub_position,
+            p.date_of_birth,
             p.market_value_in_eur,
-            p.image_url
+            p.highest_market_value_in_eur,
+            p.image_url,
+            (pp.style_vector is not null) as has_style_vector,
+            (pp.attributes_jsonb is not null) as has_attributes,
+            (pp.mentality_jsonb is not null) as has_mentality
         from players p
         left join player_profiles pp
             on pp.player_id = p.player_id

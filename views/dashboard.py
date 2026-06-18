@@ -17,9 +17,11 @@ from analysis_helpers import (
     weakness_sentence,
 )
 from explanation_engine import build_growth_explanation
-from growth_model import FEATURE_LABELS, build_growth_insight
+from growth_model import FEATURE_LABELS, build_growth_insight, build_manual_growth_insight
+from manual_prospect_helpers import manual_player_profile_panel_inputs
+from player_coverage import build_data_coverage, resolve_player_age
 from services.db import get_appearances, get_valuations
-from ui_components import render_page_actions, render_player_profile_panel
+from ui_components import render_data_coverage_panel, render_page_actions, render_player_profile_panel
 
 
 def korean_appearances(df):
@@ -35,18 +37,87 @@ def korean_appearances(df):
     return df.rename(columns=rename)
 
 
+_PROVENANCE_TEXT = (
+    "현재 분석은 DB에 저장된 선수 기본 정보, 시장가치/출전 기록, "
+    "FM 기반 능력치 및 멘탈 속성 proxy, Growth/Ceiling 규칙 모델을 바탕으로 생성되었습니다. "
+    "뉴스 기사, 감독 인터뷰, 스카우팅 텍스트 기반 정성 분석은 아직 입력되지 않았습니다."
+)
+
+_PROVENANCE_TABLE = """| 항목 | 출처 |
+|---|---|
+| 선수 기본 정보 | DB |
+| 시장가치/출전 기록 | DB |
+| 능력치/멘탈 속성 | FM proxy profile |
+| 성장 점수 | rule-based Growth/Ceiling Model |
+| 정성 텍스트 근거 | 입력 없음 |
+| Gemini 분석 | 미사용 |
+"""
+
+
 def render_dashboard_view(player, profile, ctx, entity_type):
     """Dashboard 화면 본문. app.py의 render_dashboard()가 선택 선수/프로필/
     선택 컨텍스트(resolve_selected_player_context/selected_entity_type/
     selected_player/selected_profile)를 조회한 뒤 이 함수에 전달한다
     (선택 로직은 app.py에 그대로 유지)."""
-    st.title("유망주 통합 분석 대시보드")
+    st.title("Player Dossier")
+    st.caption("선택 선수의 데이터 준비도, Growth Insight, Player Identity를 한 화면에서 확인하는 분석 허브입니다.")
+    with st.expander("분석 근거 안내"):
+        st.caption(_PROVENANCE_TEXT)
+        st.markdown(_PROVENANCE_TABLE)
 
     if player is None and profile is None:
         st.warning("먼저 Prospect Search에서 선수를 선택해 주세요.")
         return
 
+    if entity_type == "manual_prospect":
+        manual_player = st.session_state.get("manual_player") or {}
+        manual_attributes = st.session_state.get("manual_attributes") or {}
+        manual_career_settings = st.session_state.get("manual_career_settings") or {}
+
+        panel_player, panel_profile = manual_player_profile_panel_inputs(manual_player)
+        render_player_profile_panel(panel_player, panel_profile)
+        render_data_coverage_panel(panel_player, panel_profile, entity_type="manual_prospect", title="Data Coverage Panel")
+        st.info(
+            "직접 입력 유망주 모드: 입력한 능력치와 환경 설정을 기반으로 한 prototype 분석입니다. "
+            "Transfermarkt 시장가치 변화나 실제 출전 기록은 매칭되지 않아 표시할 수 없습니다."
+        )
+
+        st.subheader("Growth Insight (직접 입력 데이터 기반)")
+        st.caption("직접 입력한 능력치와 환경 설정을 바탕으로 계산한 prototype Growth Score(0~100)입니다.")
+
+        growth_insight = build_manual_growth_insight(manual_player, manual_attributes, manual_career_settings)
+        growth_explanation = build_growth_explanation(
+            growth_insight,
+            player_context={"name": manual_player.get("name"), "position": manual_player.get("position")},
+        )
+        st.session_state["growth_insight"] = growth_insight
+        st.session_state["growth_explanation"] = growth_explanation
+
+        growth_score = growth_insight["growth_score"]
+        st.metric("Growth Score", f"{growth_score:.1f} / 100")
+        st.progress(int(round(growth_score)))
+
+        st.markdown(f"<div class='scout-panel'><b>왜 이 점수가 나왔나요?</b><br>{growth_explanation['score_reason']}</div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='section-note'>{growth_explanation['summary']}</div>", unsafe_allow_html=True)
+
+        gcols = st.columns(2)
+        with gcols[0]:
+            st.markdown("<div class='scout-panel'><b>강점</b><br>" + "<br>".join(f"• {item}" for item in growth_explanation["strengths"]) + "</div>", unsafe_allow_html=True)
+            st.markdown("<div class='scout-panel'><b>추천 성장 방향</b><br>" + "<br>".join(f"• {item}" for item in growth_explanation["recommendations"]) + "</div>", unsafe_allow_html=True)
+        with gcols[1]:
+            st.markdown("<div class='scout-panel'><b>리스크</b><br>" + "<br>".join(f"• {item}" for item in growth_explanation["risks"]) + "</div>", unsafe_allow_html=True)
+
+        with st.expander("개발자용 Growth Insight 원본 데이터 보기"):
+            st.json({"growth_insight": growth_insight, "growth_explanation": growth_explanation})
+
+        render_page_actions([
+            ("🤝 유사 선수 후보에서 멘토 찾기", "유사 선수 후보", "primary"),
+            ("📈 커리어 시뮬레이션 시작", "커리어 시뮬레이션"),
+        ], title="직접 입력 유망주 · 다음 단계")
+        return
+
     render_player_profile_panel(player, profile)
+    coverage = render_data_coverage_panel(player, profile, entity_type=entity_type, title="Data Coverage Panel")
 
     if ctx["fallback_note"]:
         st.info(ctx["fallback_note"])
@@ -56,7 +127,21 @@ def render_dashboard_view(player, profile, ctx, entity_type):
     elif entity_type == "fm_profile_only":
         st.info("fm_profile_only 모드: FM 프로필 기반 후보입니다. Transfermarkt 시장가치/출전 기록은 매칭되지 않아 표시할 수 없습니다.")
     else:
-        st.info("transfermarkt_only 모드: Transfermarkt 기반 후보입니다. FM 스타일·멘탈 분석은 표시할 수 없습니다.")
+        st.warning(
+            "⚠ 이 선수는 Transfermarkt 기본 데이터만 연결되어 있어 "
+            "FM 능력치, 멘탈 지표, style_vector 기반 유사 선수 분석은 제한됩니다. "
+            "정밀 분석을 위해서는 FM profile 매칭 또는 직접 입력 유망주 기능을 사용하세요."
+        )
+        resolved_age = coverage["resolved_age"]
+        if resolved_age is not None and resolved_age != (profile.get("age") if isinstance(profile, dict) else None):
+            st.caption(
+                f"나이는 생년월일 기반으로 계산된 값입니다 ({resolved_age:.1f}세). "
+                "FM 프로필이 없어 정확한 현재 나이와 다를 수 있습니다."
+            )
+        render_page_actions([
+            ("🔍 분석 가능한 선수 다시 검색", "유망주 검색", "primary"),
+            ("✏️ 직접 입력 유망주로 보완", "직접 입력 유망주"),
+        ], title="Transfermarkt 기반 선수 · 추가 분석 방법")
 
     has_profile = isinstance(profile, dict) and profile.get("profile_id") is not None
     has_player_id = isinstance(player, dict) and player.get("player_id") is not None
@@ -64,6 +149,19 @@ def render_dashboard_view(player, profile, ctx, entity_type):
     if entity_type in ("matched", "fm_profile_only") and has_profile:
         attributes = parse_json_field(profile.get("attributes_jsonb"))
         mentality = parse_json_field(profile.get("mentality_jsonb"))
+
+        st.subheader("Player Identity")
+        st.caption("FM 기반 proxy 데이터를 활용해 포지션 역할, 능력치 강점, 멘탈 지표를 요약합니다.")
+        style_status = "style_vector 연결됨" if profile.get("style_vector") else "style_vector 없음"
+        st.markdown(
+            f"""
+            <div class="scout-panel">
+                <b>포지션/역할 요약</b><br>
+                {player.get('position') or profile.get('position') or '-'} 역할 후보 · {style_status}
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
         st.subheader("분석 요약")
         st.caption("아래 지표는 FM 기반 proxy 데이터를 요약한 prototype summary입니다.")
@@ -89,8 +187,8 @@ def render_dashboard_view(player, profile, ctx, entity_type):
             with c2:
                 attr_bar_chart(attributes_long_df(attributes, {group: keys}), height=190)
 
-        st.subheader("멘탈리티 분석")
-        st.info("현재 멘탈리티 평가는 기사/스카우팅 원문 분석이 아닌 FM 속성 기반의 대체 지표입니다.")
+        st.subheader("FM 기반 멘탈 지표 (proxy)")
+        st.info("현재 멘탈리티 수치는 기사/스카우팅 원문 분석이 아닌 FM 멘탈 속성 proxy(FM mental attributes 기반 대체 지표)입니다. 실제 선수 멘탈 특성과 다를 수 있습니다.")
 
         basis = mentality.get("basis", {}) if isinstance(mentality, dict) else {}
         mental_score = mentality.get("mentality_score") if isinstance(mentality, dict) else None
@@ -105,7 +203,21 @@ def render_dashboard_view(player, profile, ctx, entity_type):
             attr_bar_chart(attributes_long_df(basis, {"멘탈리티": MENTALITY_KEYS}), height=320)
 
     elif entity_type in ("matched", "fm_profile_only"):
+        st.subheader("Player Identity")
         st.warning("FM 프로필이 없어 스타일/멘탈 분석은 표시할 수 없습니다.")
+        render_page_actions([
+            ("✏️ 직접 입력 유망주로 보완", "직접 입력 유망주", "primary"),
+            ("🔍 분석 가능한 선수 다시 검색", "유망주 검색"),
+        ], title="Player Identity 보완")
+    else:
+        st.subheader("Player Identity")
+        st.warning(
+            "FM profile이 없어 능력치, FM 기반 멘탈 지표 proxy, style_vector 기반 플레이스타일 요약을 표시할 수 없습니다."
+        )
+        render_page_actions([
+            ("✏️ 직접 입력 유망주로 보완", "직접 입력 유망주", "primary"),
+            ("🔍 분석 가능한 선수 다시 검색", "유망주 검색"),
+        ], title="Limited 선수 · Player Identity 보완")
 
     valuations = None
     appearances = None
@@ -148,12 +260,27 @@ def render_dashboard_view(player, profile, ctx, entity_type):
         st.info("Transfermarkt 데이터와 매칭되지 않아 시장가치 변화와 최근 출전 기록 영역은 표시할 수 없습니다.")
 
     if entity_type != "manual_note":
-        st.subheader("Growth Insight (실제 DB 기반 성장 분석)")
+        # FM profile 없는 경우 나이 기반 섹션 표현 조정
+        coverage = build_data_coverage(player, profile)
+        resolved_age = coverage["resolved_age"]
+        is_old_player = resolved_age is not None and resolved_age >= 25
+        is_tm_only = entity_type == "transfermarkt_only"
+
+        if is_old_player and is_tm_only:
+            st.subheader("현재 데이터 기반 성장 분석")
+        else:
+            st.subheader("Growth Insight (실제 DB 기반 성장 분석)")
         st.caption(
             "players / appearances / player_valuations / player_profiles 데이터를 바탕으로 계산한 "
             "Growth Score(0~100)와 그 근거를 보여줍니다. 데이터가 부족한 항목은 제외하고 남은 항목의 "
             "비중을 재정규화해 계산합니다."
         )
+        if is_tm_only:
+            st.info(
+                "이 분석은 Transfermarkt 기반 제한 분석입니다. "
+                "FM profile이 없어 FM 능력치, 멘탈 지표, style_vector 기반 판단은 제외되었습니다."
+            )
+            st.caption("데이터 한계: " + ", ".join(coverage.get("missing_reasons") or ["추가 부족 항목 없음"]))
 
         growth_insight = build_growth_insight(player, profile, appearances=appearances, valuations=valuations, entity_type=entity_type)
         growth_explanation = build_growth_explanation(
@@ -204,11 +331,14 @@ def render_dashboard_view(player, profile, ctx, entity_type):
 
     if entity_type in ("matched", "fm_profile_only") and has_profile:
         render_page_actions([
-            ("🤝 유사 멘토 찾기", "유사 선수 후보", "primary"),
+            ("🤝 Style & Mentor Lab으로 이동", "유사 선수 후보", "primary"),
             ("📈 커리어 시뮬레이션 시작", "커리어 시뮬레이션"),
+            ("📄 Evidence & Advisory Report로 이동", "AI 스카우팅 리포트"),
+            ("📝 Notes로 이동", "내 스카우팅 노트"),
         ])
     else:
         render_page_actions([
-            ("📝 My Scouting Notes에서 직접 분석 보완", "내 스카우팅 노트", "primary"),
+            ("✏️ 직접 입력 유망주로 보완하기", "직접 입력 유망주", "primary"),
+            ("🔍 분석 가능한 선수 다시 검색하기", "유망주 검색"),
             ("📈 커리어 시뮬레이션 시작", "커리어 시뮬레이션"),
-        ], title="시장가치/출전 기록 기반 · 다음 단계")
+        ], title="Limited 선수 · 다음 단계")

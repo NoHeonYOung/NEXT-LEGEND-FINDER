@@ -101,6 +101,8 @@ def _build_env_settings(
     player=None,
     profile=None,
     ceiling_growth_context=None,
+    qualitative_evidence_source=None,
+    report_generation_mode="rule_based",
 ):
     result = json_safe(base_env_settings if isinstance(base_env_settings, dict) else {})
     result.update({
@@ -111,6 +113,8 @@ def _build_env_settings(
         "profile_snapshot": build_profile_snapshot(profile),
         "ceiling_growth_context": json_safe(ceiling_growth_context or {}),
         "career_settings": _career_settings(base_env_settings),
+        "qualitative_evidence_source": json_safe(qualitative_evidence_source or "none"),
+        "report_generation_mode": json_safe(report_generation_mode or "rule_based"),
     })
     return result
 
@@ -124,6 +128,8 @@ def _build_simulation_result(
     ceiling_growth_context=None,
     report_sections=None,
     generated_report_text=None,
+    qualitative_evidence=None,
+    gemini_advisory=None,
 ):
     prototype = json_safe(base_simulation_result if isinstance(base_simulation_result, dict) else {})
     result = dict(prototype)
@@ -136,6 +142,8 @@ def _build_simulation_result(
         "ceiling_growth_context": json_safe(ceiling_growth_context or {}),
         "report_sections": compact_report_sections(report_sections),
         "generated_report_text": json_safe(generated_report_text or ""),
+        "qualitative_evidence": json_safe(qualitative_evidence or {}),
+        "gemini_advisory": json_safe(gemini_advisory or {}),
     })
     return result
 
@@ -156,7 +164,19 @@ def _build_note_payload(
     ceiling_growth_context,
     report_sections,
     report_text,
+    qualitative_evidence=None,
+    gemini_advisory=None,
 ):
+    has_gemini = bool(
+        isinstance(qualitative_evidence, dict) and qualitative_evidence.get("extracted_signals")
+        or isinstance(gemini_advisory, dict) and gemini_advisory.get("advisory_summary")
+    )
+    report_generation_mode = "rule_based_with_gemini" if has_gemini else "rule_based"
+    qualitative_source = (
+        (qualitative_evidence or {}).get("source", "none")
+        if isinstance(qualitative_evidence, dict)
+        else "none"
+    )
     return {
         "env_settings": _build_env_settings(
             env_settings,
@@ -166,6 +186,8 @@ def _build_note_payload(
             player,
             profile,
             ceiling_growth_context,
+            qualitative_evidence_source=qualitative_source,
+            report_generation_mode=report_generation_mode,
         ),
         "simulation_result": _build_simulation_result(
             simulation_result,
@@ -176,6 +198,8 @@ def _build_note_payload(
             ceiling_growth_context,
             report_sections,
             report_text,
+            qualitative_evidence=qualitative_evidence,
+            gemini_advisory=gemini_advisory,
         ),
         "report": json_safe(report_text or ""),
     }
@@ -207,4 +231,6 @@ def extract_structured_note_result(simulation_result):
         "ceiling_growth_context": simulation_result.get("ceiling_growth_context") if isinstance(simulation_result.get("ceiling_growth_context"), dict) else {},
         "report_sections": simulation_result.get("report_sections") if isinstance(simulation_result.get("report_sections"), dict) else {},
         "generated_report_text": simulation_result.get("generated_report_text") or "",
+        "qualitative_evidence": simulation_result.get("qualitative_evidence") if isinstance(simulation_result.get("qualitative_evidence"), dict) else {},
+        "gemini_advisory": simulation_result.get("gemini_advisory") if isinstance(simulation_result.get("gemini_advisory"), dict) else {},
     }
