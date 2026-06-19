@@ -2,7 +2,7 @@ import streamlit as st
 
 from services.db import query_one, get_player, get_profile_by_player_id, get_player_profile
 from theme import apply_theme
-from ui_components import go_to, render_nav_chips, render_page_actions
+from ui_components import go_to, render_nav_chips
 from state import ENTITY_TYPE_LABELS, DATA_MODE_BADGE_CLASS, build_selected_player_status
 from views.db_status import render_db_status as render_db_status_view
 from views.home import render_home as render_home_view
@@ -59,16 +59,7 @@ def get_profile_by_name_nationality_position(name, nationality=None, position=No
 
 
 def resolve_selected_player_context():
-    """현재 세션에 선택된 선수의 player_id/profile_id/entity_type을
-    실제 DB 매칭 상태와 일치하도록 정리해서 반환한다.
-
-    - player_id와 profile_id가 모두 있으면 matched
-    - profile_id만 있으면 fm_profile_only
-    - player_id만 있고 profile_id가 없으면, name/nationality/position 기반으로
-      player_profiles 보조 매칭을 한 번 시도한다. 매칭되면 matched로 승격하고
-      session_state의 selected_profile_id를 채워준다. 매칭되지 않으면
-      transfermarkt_only로 처리한다.
-    """
+    """Return the selected player/profile context and keep session_state aligned."""
     raw_player_id = st.session_state.get("selected_player_id")
     raw_profile_id = st.session_state.get("selected_profile_id")
 
@@ -166,9 +157,9 @@ def selected_player():
             "sub_position": manual_player.get("sub_position"),
             "foot": manual_player.get("foot"),
             "height_in_cm": None,
-            "market_value_in_eur": None,
-            "highest_market_value_in_eur": None,
-            "image_url": None,
+            "market_value_in_eur": manual_player.get("market_value_in_eur"),
+            "highest_market_value_in_eur": manual_player.get("highest_market_value_in_eur"),
+            "image_url": manual_player.get("image_url"),
         }
 
     if ctx["entity_type"] == "fm_profile_only":
@@ -225,25 +216,17 @@ def show_selected_player_banner():
 
 
 def get_selected_player_status():
-    """Home 화면/공통 헤더에 표시할 선택 선수 상태 요약.
-
-    실제 요약 생성 로직은 state.build_selected_player_status로 이동했으며,
-    선택 로직(selected_player/selected_entity_type)은 그대로 app.py에 유지된다.
-    """
     return build_selected_player_status(selected_player(), selected_entity_type())
 
 
 def render_app_header(page_label):
-    """모든 화면 상단에 표시되는 공통 헤더: 브랜드, 현재 위치, 선택 선수 상태, 데이터 타입, navigation."""
     status = get_selected_player_status()
     entity_type = status["entity_type"]
     data_mode_label = ENTITY_TYPE_LABELS.get(entity_type, entity_type or "선택 선수 없음")
     badge_class = DATA_MODE_BADGE_CLASS.get(entity_type, DATA_MODE_BADGE_CLASS[None])
 
     if status["has_player"]:
-        status_text = (
-            f"선택 선수: <b>{status['name']}</b> · {status['club']} · {status['position']}"
-        )
+        status_text = f"선택 선수: <b>{status['name']}</b> · {status['club']} · {status['position']}"
         if status["mentor_name"]:
             status_text += f" · 멘토: <b>{status['mentor_name']}</b>"
     else:
@@ -268,14 +251,18 @@ def render_app_header(page_label):
     home_col, _ = st.columns([1, 7])
     with home_col:
         if page_label != "홈 / 서비스 소개":
-            if st.button("🏠 Home", key="header_home_button", use_container_width=True):
+            if st.button("Home", key="header_home_button", use_container_width=True):
                 go_to("홈 / 서비스 소개")
 
     render_nav_chips(page_label)
 
 
 def render_dashboard():
-    if st.session_state.get("selected_entity_type") == "manual_prospect":
+    # manual_prospect 라우팅은 manual_player 데이터가 실제로 있을 때만 활성화
+    if (
+        st.session_state.get("selected_entity_type") == "manual_prospect"
+        and st.session_state.get("manual_player")
+    ):
         return render_dashboard_view(selected_player(), None, {"fallback_note": None}, "manual_prospect")
     ctx = resolve_selected_player_context()
     entity_type = selected_entity_type()
@@ -289,54 +276,54 @@ def render_home():
     feature_cards = [
         {
             "title": "Scouting Board",
-            "description": "15~25세 기준으로 분석 가능한 유망주를 우선 검색하고 선택합니다.",
+            "description": "15~25세 기준으로 분석 준비가 된 유망주를 우선 검색하고 선택합니다.",
             "button_label": "보드 열기",
             "nav_target": "유망주 검색",
         },
         {
             "title": "Player Dossier",
-            "description": "선택한 선수의 데이터 준비도, Growth Insight, Player Identity를 확인합니다.",
+            "description": "선택한 선수의 데이터 준비도, 성장 인사이트, 플레이어 정체성을 확인합니다.",
             "button_label": "Dossier 보기",
             "nav_target": "유망주 통합 분석",
         },
         {
-            "title": "유사 선수 / 멘토 매칭",
-            "description": "FM 기반 proxy 벡터와 능력치 비교로 유사 후보를 확인합니다.",
-            "button_label": "유사 멘토 찾기",
+            "title": "Mentor Matching Lab",
+            "description": "현재 선수에게 참고가 될 만한 선배 유형과 멘토 후보를 확인합니다.",
+            "button_label": "멘토 찾기",
             "nav_target": "유사 선수 후보",
         },
         {
-            "title": "커리어 시뮬레이션",
+            "title": "Career Simulation",
             "description": "훈련 강도, 출전 기회, 리그 수준에 따른 성장 시나리오를 확인합니다.",
             "button_label": "시뮬레이션 시작",
             "nav_target": "커리어 시뮬레이션",
         },
         {
-            "title": "AI 스카우팅 리포트",
-            "description": "템플릿 기반 스카우팅 리포트 초안을 생성합니다.",
+            "title": "Scouting Report Draft",
+            "description": "정량 분석과 사용자가 입력한 정성 근거를 바탕으로 리포트 초안을 생성합니다.",
             "button_label": "리포트 생성",
             "nav_target": "AI 스카우팅 리포트",
         },
         {
-            "title": "내 스카우팅 노트",
-            "description": "AI 리포트, 커리어 시뮬레이션, 직접 입력 유망주 분석 등 저장된 노트를 모아봅니다.",
+            "title": "My Scouting Notes",
+            "description": "리포트, 커리어 시뮬레이션, 직접 입력 유망주 분석 등 저장된 노트를 모아봅니다.",
             "button_label": "저장된 노트 보기",
             "nav_target": "내 스카우팅 노트",
         },
         {
-            "title": "직접 입력 유망주",
-            "description": "능력치를 직접 입력해 유망주를 만들고, 통합 분석/멘토 매칭/시뮬레이션/리포트 흐름을 그대로 체험합니다.",
+            "title": "Manual Prospect",
+            "description": "능력치를 직접 입력해 유망주를 만들고, 통합 분석과 리포트 흐름을 체험합니다.",
             "button_label": "직접 입력하기",
             "nav_target": "직접 입력 유망주",
         },
         {
-            "title": "실험실 (Data Lab)",
-            "description": "10x10 Grid 벡터, 기사 기반 mentality evidence, Gemini 연동 구조를 샘플로 체험합니다.",
+            "title": "Experimental Data Lab",
+            "description": "실험 기능과 데이터 파이프라인 상태를 별도 공간에서 점검합니다.",
             "button_label": "실험실 열기",
             "nav_target": "실험실 (Data Lab)",
         },
         {
-            "title": "DB 상태 확인",
+            "title": "DB Status",
             "description": "Supabase 연결과 데이터 상태를 확인합니다.",
             "button_label": "DB 상태 보기",
             "nav_target": "DB 상태 확인",
@@ -355,30 +342,6 @@ def render_db_status():
 
 def render_prospect_search():
     return render_prospect_search_view(show_selected_player_banner)
-
-
-def main():
-    apply_theme()
-    st.sidebar.title("NEXT-LEGEND FINDER")
-    st.sidebar.caption("보조 메뉴 · 메인 이동은 상단 navigation chip과 화면 안의 버튼을 이용하세요.")
-    menu = {
-        "홈 / 서비스 소개": render_home,
-        "유망주 검색": render_prospect_search,
-        "유망주 통합 분석": render_dashboard,
-        "유사 선수 후보": render_legend_matching,
-        "커리어 시뮬레이션": render_career_simulation,
-        "AI 스카우팅 리포트": render_ai_report,
-        "내 스카우팅 노트": render_my_notes,
-        "직접 입력 유망주": render_manual_prospect,
-        "실험실 (Data Lab)": render_data_lab,
-        "DB 상태 확인": render_db_status,
-    }
-    if "nav_page_request" in st.session_state:
-        st.session_state["nav_page"] = st.session_state.pop("nav_page_request")
-    page = st.sidebar.radio("메뉴", list(menu.keys()), key="nav_page")
-    st.sidebar.divider()
-    render_app_header(page)
-    menu[page]()
 
 
 def render_career_simulation():
@@ -419,6 +382,30 @@ def render_my_notes():
 
 def render_manual_prospect():
     return render_manual_prospect_view()
+
+
+def main():
+    apply_theme()
+    st.sidebar.title("NEXT-LEGEND FINDER")
+    st.sidebar.caption("보조 메뉴 · 메인 이동은 상단 navigation chip과 화면 안의 버튼을 이용하세요.")
+    menu = {
+        "홈 / 서비스 소개": render_home,
+        "유망주 검색": render_prospect_search,
+        "유망주 통합 분석": render_dashboard,
+        "유사 선수 후보": render_legend_matching,
+        "커리어 시뮬레이션": render_career_simulation,
+        "AI 스카우팅 리포트": render_ai_report,
+        "내 스카우팅 노트": render_my_notes,
+        "직접 입력 유망주": render_manual_prospect,
+        "실험실 (Data Lab)": render_data_lab,
+        "DB 상태 확인": render_db_status,
+    }
+    if "nav_page_request" in st.session_state:
+        st.session_state["nav_page"] = st.session_state.pop("nav_page_request")
+    page = st.sidebar.radio("메뉴", list(menu.keys()), key="nav_page")
+    st.sidebar.divider()
+    render_app_header(page)
+    menu[page]()
 
 
 if __name__ == "__main__":

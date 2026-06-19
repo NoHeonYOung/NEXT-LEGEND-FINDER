@@ -38,10 +38,14 @@ def get_connection(db_url):
 def query_df(sql, params=None):
     conn = get_connection(load_db_url())
 
-    with conn.cursor() as cur:
-        cur.execute(sql, params or ())
-        rows = cur.fetchall()
-        columns = [desc.name for desc in cur.description]
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, params or ())
+            rows = cur.fetchall()
+            columns = [desc.name for desc in cur.description]
+    except Exception:
+        conn.rollback()
+        raise
 
     return pd.DataFrame(rows, columns=columns)
 
@@ -49,26 +53,34 @@ def query_df(sql, params=None):
 def query_one(sql, params=None):
     conn = get_connection(load_db_url())
 
-    with conn.cursor() as cur:
-        cur.execute(sql, params or ())
-        row = cur.fetchone()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, params or ())
+            row = cur.fetchone()
 
-        if row is None:
-            return None
+            if row is None:
+                return None
 
-        columns = [desc.name for desc in cur.description]
-        return dict(zip(columns, row))
+            columns = [desc.name for desc in cur.description]
+            return dict(zip(columns, row))
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def execute_one(sql, params=None):
     conn = get_connection(load_db_url())
 
-    with conn.cursor() as cur:
-        cur.execute(sql, params or ())
-        row = cur.fetchone()
-        columns = [desc.name for desc in cur.description] if cur.description else []
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, params or ())
+            row = cur.fetchone()
+            columns = [desc.name for desc in cur.description] if cur.description else []
 
-    conn.commit()
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
 
     if row is None:
         return None
@@ -162,7 +174,7 @@ def search_players(keyword="", position="", nationality="", club="", max_age=23)
             on pp.player_id = p.player_id
         where {" and ".join(conditions) if conditions else "1=1"}
         order by p.market_value_in_eur desc nulls last
-        limit 100
+        limit 500
     """
 
     return query_df(sql, tuple(params))
@@ -274,6 +286,30 @@ def get_distinct_positions(max_age=23):
     return ["All"] + df["position"].dropna().tolist()
 
 
+def get_distinct_nationalities():
+    sql = """
+        select distinct country_of_citizenship
+        from players
+        where country_of_citizenship is not null
+          and country_of_citizenship <> ''
+        order by country_of_citizenship
+    """
+    df = query_df(sql, ())
+    return df["country_of_citizenship"].dropna().tolist()
+
+
+def get_distinct_clubs():
+    sql = """
+        select distinct current_club_name
+        from players
+        where current_club_name is not null
+          and current_club_name <> ''
+        order by current_club_name
+    """
+    df = query_df(sql, ())
+    return df["current_club_name"].dropna().tolist()
+
+
 def get_player(player_id):
     sql = """
         select *
@@ -376,7 +412,7 @@ def get_similar_players(profile_id):
           and p.style_vector is not null
           and q.style_vector is not null
         order by p.style_vector <=> q.style_vector
-        limit 10
+        limit 80
     """
 
     return query_df(sql, (profile_id,))

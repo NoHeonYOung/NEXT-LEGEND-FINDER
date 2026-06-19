@@ -22,7 +22,7 @@ import os
 
 import streamlit as st
 
-DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+DEFAULT_GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite")
 
 
 def get_gemini_api_key():

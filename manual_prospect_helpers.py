@@ -140,7 +140,6 @@ def manual_similarity_candidates(manual_player, manual_attributes, limit=5):
             select profile_id, player_id, name, age, club, nationality, position, attributes_jsonb, mentality_jsonb
             from player_profiles
             where attributes_jsonb is not null
-            limit 200
         """, ())
     except Exception:
         return []
@@ -224,6 +223,8 @@ def filter_mentor_candidates_by_age(candidates, target_age, age_key="age", exclu
 
     Returns: (filtered_candidates, used_fallback)
     """
+    import math as _math
+
     target_age = safe_float(target_age, None)
     if target_age is None:
         return list(candidates), False
@@ -232,8 +233,13 @@ def filter_mentor_candidates_by_age(candidates, target_age, age_key="age", exclu
 
     def candidate_age(item):
         value = item.get(age_key) if hasattr(item, "get") else None
-        value = safe_float(value, None)
-        return value
+        f = safe_float(value, None)
+        if f is None:
+            return None
+        try:
+            return None if _math.isnan(f) else f
+        except Exception:
+            return None
 
     def is_excluded(item):
         candidate_id = item.get(id_key) if hasattr(item, "get") else None
@@ -252,6 +258,12 @@ def filter_mentor_candidates_by_age(candidates, target_age, age_key="age", exclu
     if len(fallback) > len(primary):
         return fallback, True
 
+    # 나이 데이터가 없는 후보를 마지막 폴백으로 포함
+    if len(primary) == 0 and len(fallback) == 0:
+        unknown_age = [item for item in eligible if candidate_age(item) is None]
+        if unknown_age:
+            return unknown_age[:max(min_results, 5)], True
+
     return primary, False
 
 
@@ -266,11 +278,16 @@ def manual_player_profile_panel_inputs(manual_player):
         "position": manual_player.get("position"),
         "sub_position": manual_player.get("sub_position"),
         "foot": manual_player.get("foot"),
-        "market_value_in_eur": None,
-        "highest_market_value_in_eur": None,
-        "image_url": None,
+        "market_value_in_eur": manual_player.get("market_value_in_eur"),
+        "highest_market_value_in_eur": manual_player.get("highest_market_value_in_eur"),
+        "image_url": manual_player.get("image_url"),
     }
-    profile = {"age": manual_player.get("age")}
+    profile = {
+        "age": manual_player.get("age"),
+        "attributes_jsonb": {"available": True},
+        "mentality_jsonb": {"available": True},
+        "style_vector": [1],
+    }
     return player, profile
 
 
@@ -329,7 +346,13 @@ def build_manual_analysis(manual_player, manual_attributes, env_settings, simula
         f"성장 잠재력 {safe_float(manual_attributes.get('growth_potential'), 0)}/10 수준에서 {manual_nationality}의 환경 속에서 안정적인 성장을 기대할 수 있습니다."
     )
 
-    mentor_candidates = manual_similarity_candidates(manual_player, manual_attributes, limit=5)
+    mentor_pool = manual_similarity_candidates(manual_player, manual_attributes, limit=200)
+    mentor_candidates, _ = filter_mentor_candidates_by_age(
+        mentor_pool,
+        manual_player.get("age"),
+        min_results=1,
+    )
+    mentor_candidates = mentor_candidates[:12]
     mentor_guide = "이 선수는 현재 입력값 기준으로 멘토 후보와의 공통 강점을 바탕으로 성장 루트를 설계할 수 있습니다. " + position_hint
 
     return {

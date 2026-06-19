@@ -14,7 +14,7 @@ ENTITY_TYPE_LABELS = {
     "fm_profile_only": "FM 프로필 기반 후보",
     "transfermarkt_only": "Transfermarkt 기반 후보",
     "manual_note": "직접 입력 기반 분석",
-    "manual_prospect": "직접 입력 유망주",
+    "manual_prospect": "직접 입력 선수",
     None: "선택 선수 없음",
 }
 

@@ -152,16 +152,16 @@ def _build_note_payload(
     *,
     note_type,
     source,
-    entity_type,
+    entity_type=None,
     player,
     profile,
     env_settings,
     simulation_result,
     growth_insight,
     growth_explanation,
-    ceiling_growth_insight,
-    ceiling_growth_explanation,
-    ceiling_growth_context,
+    ceiling_growth_insight=None,
+    ceiling_growth_explanation=None,
+    ceiling_growth_context=None,
     report_sections,
     report_text,
     qualitative_evidence=None,
@@ -177,7 +177,12 @@ def _build_note_payload(
         if isinstance(qualitative_evidence, dict)
         else "none"
     )
+    safe_player = player if isinstance(player, dict) else {}
+    safe_profile = profile if isinstance(profile, dict) else {}
     return {
+        "player_id": json_safe(safe_player.get("player_id")),
+        "profile_id": json_safe(safe_profile.get("profile_id")),
+        "player_name": json_safe(safe_player.get("name") or safe_profile.get("name")),
         "env_settings": _build_env_settings(
             env_settings,
             note_type,
@@ -213,8 +218,92 @@ def build_career_simulation_note_payload(**kwargs):
     return _build_note_payload(note_type="career_simulation", source="career_simulation", **kwargs)
 
 
+def _manual_report_text(report_sections):
+    if not isinstance(report_sections, dict) or not report_sections:
+        return ""
+    lines = ["직접 입력 유망주 분석 리포트"]
+    for title, content in report_sections.items():
+        lines.extend(["", str(title), str(content)])
+    return "\n".join(lines)
+
+
 def build_manual_note_payload(**kwargs):
-    return _build_note_payload(note_type="manual_custom_prospect", source="manual_note", **kwargs)
+    source = kwargs.pop("source", "manual_note")
+    source_player = kwargs.pop("player", {}) or {}
+    source_profile = kwargs.pop("profile", {}) or {}
+    kwargs.pop("entity_type", None)
+    raw_env_settings = kwargs.pop("env_settings", {})
+    env_settings = raw_env_settings if isinstance(raw_env_settings, dict) else {}
+    manual_player = kwargs.pop("manual_player", None)
+    if not isinstance(manual_player, dict) or not manual_player:
+        manual_player = env_settings.get("manual_player") if isinstance(env_settings.get("manual_player"), dict) else {}
+    if not manual_player:
+        manual_player = source_player if isinstance(source_player, dict) else {}
+    manual_attributes = kwargs.pop("manual_attributes", None)
+    if not isinstance(manual_attributes, dict):
+        manual_attributes = env_settings.get("manual_attributes") if isinstance(env_settings.get("manual_attributes"), dict) else {}
+    manual_career_settings = kwargs.pop("manual_career_settings", None)
+    if not isinstance(manual_career_settings, dict):
+        manual_career_settings = env_settings.get("manual_career_settings") if isinstance(env_settings.get("manual_career_settings"), dict) else {}
+    report_sections = kwargs.get("report_sections") if isinstance(kwargs.get("report_sections"), dict) else {}
+    report_text = kwargs.pop("report_text", None) or _manual_report_text(report_sections)
+
+    player_id = manual_player.get("estimated_from_player_id")
+    if player_id is None and isinstance(source_player, dict):
+        player_id = source_player.get("player_id")
+    player = {
+        "player_id": player_id,
+        "name": manual_player.get("name"),
+        "age": manual_player.get("age"),
+        "position": manual_player.get("position"),
+        "sub_position": manual_player.get("sub_position"),
+        "club": manual_player.get("club"),
+        "current_club_name": manual_player.get("club"),
+        "nationality": manual_player.get("nationality"),
+        "country_of_citizenship": manual_player.get("nationality"),
+    }
+    if isinstance(source_player, dict):
+        for key in ("name", "age", "position", "sub_position", "club", "current_club_name", "nationality", "country_of_citizenship"):
+            if player.get(key) is None:
+                player[key] = source_player.get(key)
+    profile = {
+        "profile_id": source_profile.get("profile_id") if isinstance(source_profile, dict) else None,
+        "name": manual_player.get("name"),
+        "age": manual_player.get("age"),
+        "position": manual_player.get("position"),
+        "sub_position": manual_player.get("sub_position"),
+        "club": manual_player.get("club"),
+        "nationality": manual_player.get("nationality"),
+        "attributes_jsonb": manual_attributes,
+        "mentality_jsonb": manual_attributes,
+    }
+    if isinstance(source_player, dict):
+        profile["name"] = profile.get("name") or source_player.get("name")
+        profile["age"] = profile.get("age") or source_player.get("age")
+        profile["position"] = profile.get("position") or source_player.get("position")
+        profile["club"] = profile.get("club") or source_player.get("club") or source_player.get("current_club_name")
+    env_settings = dict(env_settings)
+    env_settings.setdefault("manual_player", manual_player)
+    env_settings.setdefault("manual_attributes", manual_attributes)
+    env_settings.setdefault("manual_career_settings", manual_career_settings)
+
+    payload = _build_note_payload(
+        note_type="manual_custom_prospect",
+        source=source,
+        entity_type="manual_prospect",
+        player=player,
+        profile=profile,
+        env_settings=env_settings,
+        report_text=report_text,
+        **kwargs,
+    )
+    payload["env_settings"]["manual_player"] = json_safe(manual_player)
+    payload["env_settings"]["manual_attributes"] = json_safe(manual_attributes)
+    payload["env_settings"]["manual_career_settings"] = json_safe(manual_career_settings)
+    payload["simulation_result"]["manual_player"] = json_safe(manual_player)
+    payload["simulation_result"]["manual_attributes"] = json_safe(manual_attributes)
+    payload["simulation_result"]["manual_career_settings"] = json_safe(manual_career_settings)
+    return payload
 
 
 def extract_structured_note_result(simulation_result):

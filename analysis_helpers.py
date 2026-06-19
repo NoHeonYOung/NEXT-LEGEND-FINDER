@@ -151,10 +151,12 @@ def attr_bar_chart(df, title=None, height=230):
         return
     chart = (
         alt.Chart(work)
-        .mark_bar(cornerRadiusEnd=4, color="#2A9D8F")
+        .mark_bar(cornerRadiusEnd=4, color="#39d5bd")
         .encode(
-            x=alt.X("점수:Q", scale=alt.Scale(domain=[0, 20]), title="점수"),
-            y=alt.Y("능력치:N", sort="-x", title=None),
+            x=alt.X("점수:Q", scale=alt.Scale(domain=[0, 20]), title="점수",
+                    axis=alt.Axis(labelColor="#8ea0b8", titleColor="#8ea0b8", gridColor="rgba(255,255,255,0.06)")),
+            y=alt.Y("능력치:N", sort="-x", title=None,
+                    axis=alt.Axis(labelColor="#e7eef8", labelFontSize=12)),
             tooltip=[
                 alt.Tooltip("그룹:N", title="그룹"),
                 alt.Tooltip("능력치:N", title="능력치"),
@@ -162,8 +164,10 @@ def attr_bar_chart(df, title=None, height=230):
                 alt.Tooltip("설명:N", title="설명"),
             ],
         )
+        .configure_view(fill="transparent", stroke="transparent")
+        .configure_axis(domainColor="rgba(255,255,255,0.12)")
     )
-    props = {"height": height}
+    props = {"height": height, "background": "transparent"}
     if title:
         props["title"] = str(title)
     st.altair_chart(chart.properties(**props), use_container_width=True)
@@ -274,8 +278,7 @@ def build_simulation_result(env_settings):
         "prototype_success_probability": success_probability,
         "prototype_injury_risk": injury_risk,
         "message": (
-            "현재 결과는 실제 예측 모델이 아니라 UI 흐름 검증을 위한 "
-            "프로토타입 시뮬레이션 결과입니다."
+            "선택한 훈련 강도, 출전 기회, 리그 수준, 리스크 성향을 반영한 참고용 시뮬레이션입니다."
         ),
     }
 
@@ -447,73 +450,127 @@ def generate_similarity_reason(selected_player, candidate_player, selected_attrs
     candidate_higher_names = attr_names(comparison["candidate_higher"])
     selected_higher_names = attr_names(comparison["selected_higher"])
 
-    if common_names:
-        similarity_reason = (
-            f"두 선수는 {common_names}에서 공통으로 높은 수치를 보여 유사한 역할 후보로 해석할 수 있습니다. "
-            "pgvector 유사도는 FM 기반 proxy style_vector(24차원) 전반의 가까움을 함께 반영합니다."
-        )
-        common_strengths = common_names
-    else:
-        similarity_reason = (
-            "공통으로 높게 나타난 세부 능력치는 제한적이지만, FM 기반 proxy style_vector(24차원) "
-            "전반의 거리가 가까워 비교 후보로 제시되었습니다."
-        )
-        common_strengths = "세부 공통 강점 데이터가 부족합니다."
+    has_selected_attrs = bool(selected_attrs)
+    has_candidate_attrs = bool(candidate_attrs)
 
+    # 공통점 (사용자 친화 문구)
+    if common_names:
+        common_strengths = (
+            f"이 선수는 현재 선택 선수와 {common_names} 능력치 패턴이 유사합니다. "
+            "공격 역할, 움직임 유형, 주요 능력치 강점이 비슷한 유형으로 볼 수 있습니다."
+        )
+    else:
+        common_strengths = (
+            "세부 능력치에서 공통으로 두드러지는 항목은 확인되지 않았지만, "
+            "전반적인 능력치 패턴이 유사해 비교 후보로 선정되었습니다."
+        )
+
+    # 차이점 (사용자 친화 문구)
     difference_parts = []
     if candidate_higher_names:
-        difference_parts.append(f"후보가 앞선 능력치는 {candidate_higher_names}입니다")
+        difference_parts.append(f"후보 선수가 상대적으로 앞선 부분: {candidate_higher_names}")
     if selected_higher_names:
-        difference_parts.append(f"선택 선수가 앞선 능력치는 {selected_higher_names}입니다")
-    differences = ". ".join(difference_parts) + "." if difference_parts else "뚜렷한 능력치 차이 데이터가 부족합니다."
+        difference_parts.append(f"현재 선수가 상대적으로 앞선 부분: {selected_higher_names}")
+    if difference_parts:
+        differences = ". ".join(difference_parts) + ". 세부 능력치나 출전 경험, 시장가치 흐름은 다를 수 있으므로 직접적인 동일 유형으로 단정하면 안 됩니다."
+    else:
+        differences = "두 선수의 능력치 프로필이 전반적으로 유사합니다. 출전 경험과 시장가치 흐름은 별도로 확인하세요."
 
+    # 전술적 해석 (사용자 친화 문구)
     position = selected_player.get("position") or candidate_player.get("position") or "현재 포지션"
     improvement_names = candidate_higher_names or "세부 능력치"
     tactical_interpretation = (
-        f"{position} 역할에서 {common_names or '전반적인 스타일'}을 공통 기반으로 활용할 수 있습니다. "
+        f"현재 선수의 장점을 키우려면 이 후보와 유사한 역할에서 어떤 능력치를 강화해야 하는지 참고할 수 있습니다. "
         f"{position_training_hint(position, improvement_names)}"
     )
+
+    # 개발자용 근거 (expander에서만 노출)
+    dev_notes = []
+    if not has_selected_attrs:
+        dev_notes.append("선택 선수 능력치 데이터 부족")
+    if not has_candidate_attrs:
+        dev_notes.append("후보 선수 능력치 데이터 부족")
+    dev_notes.append("플레이스타일 유사도 기반 비교 (실제 위치 이벤트 데이터 미포함)")
+    data_limit = ". ".join(dev_notes) + "."
+
     return {
         "comparison": comparison,
         "common_strengths": common_strengths,
         "differences": differences,
-        "similarity_reason": similarity_reason,
+        "similarity_reason": common_strengths,
         "tactical_interpretation": tactical_interpretation,
+        "data_limit": data_limit,
     }
 
 
 def generate_mentor_guide(selected_player, mentor_player, selected_attrs, mentor_attrs, simulation_result=None):
     reason = generate_similarity_reason(selected_player, mentor_player, selected_attrs, mentor_attrs)
     comparison = reason["comparison"]
+
+    mentor_age = mentor_player.get("age")
+    selected_age = selected_player.get("age")
+    age_gap_text = ""
+    if mentor_age is not None and selected_age is not None:
+        gap = mentor_age - selected_age
+        if gap > 0:
+            age_gap_text = f"멘토 후보는 선택 선수보다 {gap}세 연상으로, 나이 조건(+3~+5세)을 만족합니다."
+        else:
+            age_gap_text = f"멘토 후보가 선택 선수보다 {abs(gap)}세 어리거나 같아 완화 기준이 적용되었습니다."
+    elif mentor_age is not None:
+        age_gap_text = f"멘토 후보 나이 {mentor_age}세 기준입니다."
+
     if not comparison["common_high"] and not comparison["mentor_higher"]:
-        limited = "현재 후보 선수의 세부 능력치 데이터가 부족하여 상세 멘토링은 제한적으로 제공됩니다."
+        limited = "현재 데이터로는 상세 멘토링 가이드를 제공하기 어렵습니다."
         return {
-            "similarity_reason": limited,
+            "similarity_reason": limited + f" {age_gap_text}",
             "improvement_points": limited,
-            "training_recommendation": "우선 선택 선수의 출전 기록과 시장가치 흐름을 함께 확인하며 기본 성장 방향을 설정하는 것이 좋습니다.",
+            "training_recommendation": "출전 기록과 시장가치 흐름을 함께 확인하며 기본 성장 방향을 설정하는 것이 좋습니다.",
             "career_advice": "현재 단계에서는 무리한 이적보다 안정적인 출전 시간을 확보할 수 있는 환경을 우선 검토하는 전략이 적합합니다.",
             "mentor_summary": limited,
         }
 
-    common_names = attr_names(comparison["common_high"]) or "스타일 벡터 전반"
+    common_names = attr_names(comparison["common_high"]) or "전반적인 능력치 패턴"
     improvement_names = attr_names(comparison["mentor_higher"]) or "세부 능력치"
     selected_better = attr_names(comparison["selected_higher"]) or "일부 강점"
     similarity_reason = reason["similarity_reason"]
-    improvement_points = f"선택 유망주는 후보 선수와 비교했을 때 {improvement_names}에서 보완 여지가 있습니다. 반대로 {selected_better}에서는 선택 유망주가 이미 경쟁력을 보일 수 있습니다."
-    training_recommendation = reason["tactical_interpretation"]
-    career_advice = f"현재 유망주의 시장가치는 {money(selected_player.get('market_value_in_eur'))}입니다. 상위 리그 이적보다 안정적인 출전 시간을 확보할 수 있는 팀에서 성장하는 전략을 우선 검토하는 것이 좋습니다."
+
+    # 멘토 적합 이유 (사용자 친화)
+    full_reason = (
+        f"나이와 경험 면에서 현재 선수보다 앞선 후보이며, 유사한 역할에서 참고할 수 있는 능력치 패턴을 보입니다. "
+        f"{age_gap_text or ''} "
+        f"{common_names} 능력치를 공통 기반으로 비교할 수 있습니다."
+    ).strip()
+
+    # 보완할 점 (사용자 친화)
+    improvement_points = (
+        f"현재 선수는 {improvement_names} 부분에서 멘토 후보를 참고해 보완 방향을 찾을 수 있습니다. "
+        f"{selected_better} 부분은 현재 선수가 상대적으로 강점을 보이는 영역입니다."
+    )
+
+    # 배울 수 있는 훈련 방향 (사용자 친화)
+    position = selected_player.get("position") or mentor_player.get("position") or "현재 포지션"
+    training_recommendation = (
+        f"{position_training_hint(position, improvement_names)} "
+        f"멘토 후보의 {improvement_names} 능력치 활용 방식을 참고해 해당 역할의 판단 타이밍과 포지셔닝을 집중 관찰하세요."
+    )
+
+    # 주의할 점 (사용자 친화)
+    career_advice = (
+        "유사도는 참고 지표이므로 실제 경기 스타일이나 리그 수준 차이는 별도로 확인해야 합니다. "
+        "상위 리그 이적보다 안정적인 출전 시간을 확보할 수 있는 환경에서 먼저 성장하는 전략을 검토하는 것이 좋습니다."
+    )
     if simulation_result:
-        career_advice += f" 현재 시뮬레이션 기준 성공 가능성은 {format_percent(simulation_result.get('prototype_success_probability'))}입니다."
+        career_advice += f" 현재 시뮬레이션 기준 성공 가능성: {format_percent(simulation_result.get('prototype_success_probability'))}."
+
     mentor_summary = (
         f"멘토 후보 {mentor_player.get('name') or '-'} 참고 가이드. "
-        f"유사 후보 이유: {similarity_reason} "
+        f"적합 이유: {full_reason} "
         f"보완할 점: {improvement_points} "
-        f"추천 훈련: {training_recommendation} "
-        f"커리어 조언: {career_advice} "
-        "이 내용은 실제 레전드 성장 로그가 아니라 FM 기반 proxy 능력치 차이를 활용한 프로토타입 조언입니다."
+        f"훈련 방향: {training_recommendation} "
+        f"주의사항: {career_advice}"
     )
     return {
-        "similarity_reason": similarity_reason,
+        "similarity_reason": full_reason,
         "improvement_points": improvement_points,
         "training_recommendation": training_recommendation,
         "career_advice": career_advice,

@@ -2,35 +2,18 @@ import streamlit as st
 
 
 WORKFLOW_STEPS = [
-    (1, "Search", "DB에서 분석할 유망주를 검색하고 선택합니다.", "유망주 검색"),
-    (2, "Analyze", "선택한 선수의 시장가치, 출전 기록, FM 능력치를 통합 분석합니다.", "유망주 통합 분석"),
-    (3, "Match Mentor", "FM 기반 proxy 벡터로 유사한 선수(멘토) 후보를 찾습니다.", "유사 선수 후보"),
-    (4, "Simulate Career", "훈련 강도, 출전 기회, 리그 수준에 따른 성장 시나리오를 확인합니다.", "커리어 시뮬레이션"),
-    (5, "Generate Report", "시뮬레이션 결과를 바탕으로 스카우팅 리포트 초안을 생성합니다.", "AI 스카우팅 리포트"),
-    (6, "Save Notes", "분석 결과를 My Scouting Notes에 저장하고 조회합니다.", "내 스카우팅 노트"),
+    (1, "Search", "분석에 필요한 핵심 데이터가 갖춰진 유망주를 검색하고 선택합니다.", "유망주 검색"),
+    (2, "Analyze", "선수의 성장 점수, 능력치, 멘탈/성향 근거를 Player Dossier에서 확인합니다.", "유망주 통합 분석"),
+    (3, "Match Mentor", "나이와 경험이 더 앞선 멘토 후보를 찾아 어떤 점을 배울 수 있는지 확인합니다.", "유사 선수 후보"),
+    (4, "Simulate Career", "훈련, 출전 기회, 리그 난이도에 따른 성장 시나리오를 비교합니다.", "커리어 시뮬레이션"),
+    (5, "Generate Report", "정량 분석과 정성 메모를 바탕으로 스카우팅 리포트 초안을 만듭니다.", "AI 스카우팅 리포트"),
+    (6, "Save Notes", "분석 결과를 My Scouting Notes에 저장하고 다시 확인합니다.", "내 스카우팅 노트"),
 ]
 
 DATA_MODE_GUIDE = [
-    (
-        "matched",
-        "Matched (FM + Transfermarkt 통합)",
-        "시장가치 · 출전 기록 · FM 능력치/멘탈 분석 · 유사 멘토 매칭이 모두 가능합니다.",
-    ),
-    (
-        "transfermarkt_only",
-        "Transfermarkt Only",
-        "시장가치와 출전 기록은 확인할 수 있지만, FM 스타일/멘탈 분석과 유사 멘토 매칭은 제한됩니다.",
-    ),
-    (
-        "fm_profile_only",
-        "FM Profile Only",
-        "FM 능력치/멘탈 분석과 유사 멘토 매칭은 가능하지만, 시장가치와 출전 기록은 제한됩니다.",
-    ),
-    (
-        "manual_note",
-        "Manual Note (직접 입력)",
-        "My Scouting Notes에서 직접 입력한 능력치를 바탕으로 프로토타입 분석을 진행합니다.",
-    ),
+    ("matched", "종합 분석 가능 선수", "시장가치, 출전 기록, 능력치, 멘탈/성향, 멘토 비교를 함께 볼 수 있습니다."),
+    ("fm_profile_only", "능력치 기반 분석 선수", "능력치와 멘토 비교는 가능하지만 시장가치/출전 기록은 제한될 수 있습니다."),
+    ("manual_prospect", "직접 입력 선수", "직접 입력한 능력치를 바탕으로 실험적인 분석 흐름을 체험합니다."),
 ]
 
 
@@ -42,7 +25,7 @@ def go_to(nav_target):
 def render_home(status, feature_cards):
     render_hero(status)
     render_scouting_context(status)
-    render_workflow(status)
+    render_workflow()
     render_quick_actions()
     render_data_mode_guide(status)
     render_feature_grid(feature_cards)
@@ -53,8 +36,7 @@ def render_hero(status):
         """
         <div class="hero-cta">
             <h1>NEXT-LEGEND FINDER</h1>
-            <p>유망주를 검색하고, 통합 분석과 유사 멘토 매칭을 거쳐 커리어 시뮬레이션과
-            스카우팅 리포트, 노트 저장까지 이어지는 구단 내부 스카우팅 센터 프로토타입입니다.</p>
+            <p>유망주를 찾고, 성장 가능성을 해석하고, 멘토와 커리어 시나리오까지 이어 보는 스카우팅 워크룸입니다.</p>
         </div>
         """,
         unsafe_allow_html=True,
@@ -62,13 +44,13 @@ def render_hero(status):
 
     c1, c2, c3 = st.columns(3)
     with c1:
-        if st.button("🔎 유망주 검색 시작", type="primary", use_container_width=True):
+        if st.button("유망주 검색 시작", type="primary", width="stretch"):
             go_to("유망주 검색")
     with c2:
-        if st.button("📝 직접 노트 작성", use_container_width=True):
-            go_to("내 스카우팅 노트")
+        if st.button("직접 입력 유망주", width="stretch"):
+            go_to("직접 입력 유망주")
     with c3:
-        if st.button("🗂️ DB 상태 확인", use_container_width=True):
+        if st.button("DB 상태 확인", width="stretch"):
             go_to("DB 상태 확인")
 
 
@@ -80,7 +62,7 @@ def render_scouting_context(status):
             """
             <div class="scout-panel">
                 <h3 style="margin-top: 0;">아직 선택된 선수가 없습니다</h3>
-                <p>유망주 검색에서 선수를 선택하거나, My Scouting Notes에서 직접 입력해보세요.</p>
+                <p>Scouting Board에서 분석할 선수를 선택하면 Dossier, Mentor Lab, Career Simulation, Report가 이어집니다.</p>
             </div>
             """,
             unsafe_allow_html=True,
@@ -88,22 +70,10 @@ def render_scouting_context(status):
         return
 
     entity_type = status["entity_type"]
-    can_analyze = entity_type in ("matched", "transfermarkt_only", "fm_profile_only")
     can_mentor = entity_type in ("matched", "fm_profile_only")
-    can_report = True
-
     mentor_line = ""
     if status.get("mentor_name"):
         mentor_line = f'<div><b>선택 멘토</b> {status["mentor_name"]}</div>'
-
-    capability_badges = "".join(
-        f'<span class="scout-badge">{label}</span>'
-        for label, available in [
-            ("통합 분석 가능" if can_analyze else "통합 분석 제한", can_analyze),
-            ("유사 멘토 매칭 가능" if can_mentor else "유사 멘토 매칭 제한", can_mentor),
-            ("리포트 생성 가능" if can_report else "리포트 생성 제한", can_report),
-        ]
-    )
 
     st.markdown(
         f"""
@@ -116,8 +86,6 @@ def render_scouting_context(status):
                 <span class="scout-badge">{status['entity_label']}</span>
             </div>
             {mentor_line}
-            <div class="muted" style="margin-top: 10px;">현재 가능한 작업</div>
-            <div class="badge-row">{capability_badges}</div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -125,16 +93,16 @@ def render_scouting_context(status):
 
     c1, c2 = st.columns(2)
     with c1:
-        if st.button("📊 통합 분석으로 이동", use_container_width=True, type="primary"):
+        if st.button("Player Dossier로 이동", width="stretch", type="primary"):
             go_to("유망주 통합 분석")
     with c2:
-        if st.button("🤝 유사 멘토 찾기", use_container_width=True, disabled=not can_mentor):
+        if st.button("멘토 후보 찾기", width="stretch", disabled=not can_mentor):
             go_to("유사 선수 후보")
 
 
-def render_workflow(status):
+def render_workflow():
     st.subheader("Scouting Workflow")
-    st.caption("아래 단계를 순서대로 따라가면 검색부터 노트 저장까지 자연스럽게 이어집니다.")
+    st.caption("아래 순서대로 진행하면 검색부터 리포트 저장까지 자연스럽게 이어집니다.")
 
     for step_no, title, description, target in WORKFLOW_STEPS:
         cols = st.columns([5, 1])
@@ -142,14 +110,14 @@ def render_workflow(status):
             st.markdown(
                 f"""
                 <div class="workflow-step">
-                    <span class="step-no">{step_no}</span><b>{title}</b>
+                    <b>{step_no}. {title}</b>
                     <div class="muted">{description}</div>
                 </div>
                 """,
                 unsafe_allow_html=True,
             )
         with cols[1]:
-            if st.button("이동", key=f"workflow_step_{step_no}", use_container_width=True):
+            if st.button("이동", key=f"workflow_step_{step_no}", width="stretch"):
                 go_to(target)
 
 
@@ -159,26 +127,26 @@ def render_quick_actions():
     with c1:
         with st.container(border=True):
             st.markdown("**DB 상태 확인**")
-            st.write("Supabase 연결과 데이터 현황을 확인합니다.")
-            if st.button("DB 상태 보기", key="quick_db_status", use_container_width=True):
+            st.write("Supabase 연결과 데이터 상태를 확인합니다.")
+            if st.button("DB 상태 보기", key="quick_db_status", width="stretch"):
                 go_to("DB 상태 확인")
     with c2:
         with st.container(border=True):
             st.markdown("**My Scouting Notes**")
             st.write("저장된 스카우팅 노트를 조회합니다.")
-            if st.button("노트 조회", key="quick_notes", use_container_width=True):
+            if st.button("노트 조회", key="quick_notes", width="stretch"):
                 go_to("내 스카우팅 노트")
     with c3:
         with st.container(border=True):
-            st.markdown("**직접 입력 유망주 분석**")
-            st.write("DB에 없는 유망주를 직접 입력해 프로토타입 분석을 생성합니다.")
-            if st.button("직접 입력 시작", key="quick_manual", use_container_width=True):
-                go_to("내 스카우팅 노트")
+            st.markdown("**직접 입력 유망주**")
+            st.write("DB에 없는 선수를 직접 입력해 분석 흐름을 체험합니다.")
+            if st.button("직접 입력 시작", key="quick_manual", width="stretch"):
+                go_to("직접 입력 유망주")
 
 
 def render_data_mode_guide(status):
-    st.subheader("Data Mode Guide")
-    st.caption("선택한 선수의 데이터 타입에 따라 분석 가능한 범위가 달라집니다.")
+    st.subheader("분석 데이터 안내")
+    st.caption("현재 검색은 기본적으로 모든 핵심 분석 데이터가 있는 선수만 보여주도록 설정되어 있습니다.")
 
     active_entity = status.get("entity_type")
     for entity_type, title, description in DATA_MODE_GUIDE:
@@ -196,7 +164,7 @@ def render_data_mode_guide(status):
 
 def render_feature_grid(feature_cards):
     st.subheader("전체 메뉴")
-    st.caption("아래 카드를 눌러 원하는 화면으로 바로 이동할 수 있습니다.")
+    st.caption("아래 카드에서 원하는 화면으로 바로 이동할 수 있습니다.")
 
     cols = st.columns(3)
     for index, card in enumerate(feature_cards):
@@ -204,7 +172,7 @@ def render_feature_grid(feature_cards):
             with st.container(border=True):
                 st.markdown(f"**{card['title']}**")
                 st.write(card["description"])
-                if st.button(card["button_label"], key=f"home_nav_{card['nav_target']}", use_container_width=True):
+                if st.button(card["button_label"], key=f"home_nav_{card['nav_target']}", width="stretch"):
                     go_to(card["nav_target"])
 
-    st.info("공식 Football Manager 자산을 복제하지 않고, 정보 구조와 분위기만 참고한 스카우팅 대시보드 프로토타입입니다.")
+    st.info("Football Manager 고유 로고나 에셋을 복제하지 않고, 스포츠 매니지먼트 UI의 정보 구조만 참고한 독립 프로젝트입니다.")

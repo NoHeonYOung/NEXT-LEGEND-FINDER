@@ -9,11 +9,29 @@ app.py를 import하지 않는다(순환 import 방지).
 from growth_model import FEATURE_LABELS, GROWTH_WEIGHTS, LEVEL_DESCRIPTIONS
 
 
+# FEATURE_LABELS의 개발자 용어를 사용자 친화 표현으로 덮어씁니다.
+_FRIENDLY_LABELS = {**FEATURE_LABELS, "attribute_strength": "능력치 점수"}
+
+
+def _label(feature_name):
+    return _FRIENDLY_LABELS.get(feature_name, feature_name)
+
+
 ENTITY_TYPE_CONTEXT_NOTES = {
-    "matched": "Transfermarkt 실데이터와 FM 능력치 프로필이 모두 매칭되어, 시장가치/출전 기록/능력치/멘탈리티를 종합적으로 반영한 평가입니다.",
-    "fm_profile_only": "FM 능력치 프로필만 연결되어 있어, 시장가치 흐름과 출전 기회 항목은 반영되지 않았습니다. 능력치/멘탈리티 중심의 제한적 평가입니다.",
-    "transfermarkt_only": "Transfermarkt 실데이터만 연결되어 있어, FM 능력치/멘탈리티 항목은 반영되지 않았습니다. 시장가치와 출전 기록 중심의 제한적 평가입니다.",
-    "manual_note": "사용자가 직접 입력한 조건(훈련강도/리그난이도/출전기회/리스크성향/능력치)을 바탕으로 한 prototype 평가이며, 실제 DB 기반 예측이 아닙니다.",
+    "matched": "Transfermarkt 실데이터와 능력치 프로필이 모두 매칭되어, 시장가치/출전 기록/능력치/멘탈리티를 종합적으로 반영한 평가입니다.",
+    "fm_profile_only": "능력치 프로필만 연결되어 있어, 시장가치 흐름과 출전 기회 항목은 반영되지 않았습니다. 능력치/멘탈리티 중심의 제한적 평가입니다.",
+    "transfermarkt_only": "Transfermarkt 실데이터만 연결되어 있어, 능력치/멘탈리티 항목은 반영되지 않았습니다. 시장가치와 출전 기록 중심의 제한적 평가입니다.",
+    "manual_note": "직접 입력한 능력치와 환경 설정을 기반으로 성장 가능성을 평가했습니다. 시장가치와 실제 출전 기록이 없으므로 해당 항목은 제한적으로 반영됩니다.",
+}
+
+# feature별 출처 badge 라벨 매핑
+FEATURE_SOURCE_BADGES = {
+    "market_momentum": ["Transfermarkt"],
+    "playing_opportunity": ["Transfermarkt"],
+    "contribution_score": ["Transfermarkt"],
+    "age_potential": ["DB"],
+    "attribute_strength": ["능력치 기반"],
+    "mentality_strength": ["능력치 기반"],
 }
 
 
@@ -24,49 +42,165 @@ def _contribution(feature_name, feature_result):
     return GROWTH_WEIGHTS[feature_name] * feature_result["score"] * 100
 
 
+def _level_text(score):
+    if score >= 0.65:
+        return "긍정적"
+    if score >= 0.4:
+        return "보통 수준"
+    return "보완이 필요한"
+
+
 def explain_feature_score(feature_name, feature_result):
-    """개별 feature 점수에 대한 한 문장 설명을 만든다."""
-    label = FEATURE_LABELS.get(feature_name, feature_name)
+    """개별 feature 점수에 대한 구조화된 설명을 만든다.
+
+    강점/보완점 모두 4부 구조(핵심 / 근거 / 해석 / 방향)로 설명한다.
+    실제 데이터에 없는 사실을 만들지 않는다.
+    """
+    label = _label(feature_name)
 
     if feature_result.get("status") != "ok":
         reason = feature_result.get("detail", {}).get("reason", "데이터가 부족합니다.")
+        # 내부 키 이름이 사용자 화면에 노출되지 않도록 치환
+        reason = reason.replace("FM 프로필이 없습니다.", "능력치 프로필이 없습니다.")
+        reason = reason.replace("attributes_jsonb", "능력치 데이터")
+        reason = reason.replace("mentality_jsonb", "멘탈 데이터")
         return f"{label}: 데이터가 부족하여({reason}) 이번 평가에서 제외되었습니다."
 
     score = feature_result["score"]
     detail = feature_result.get("detail", {})
-
-    if score >= 0.65:
-        level_text = "긍정적"
-    elif score >= 0.4:
-        level_text = "보통 수준"
-    else:
-        level_text = "보완이 필요한"
+    lt = _level_text(score)
+    is_strength = score >= 0.6
+    score_pct = f"{score * 100:.0f}점"
 
     if feature_name == "market_momentum":
         growth = detail.get("market_growth")
-        trend = "상승" if growth is not None and growth > 0 else ("하락" if growth is not None and growth < 0 else "정체")
-        return f"{label}: 최근 valuation이 {trend} 흐름을 보여 {level_text} 평가({score * 100:.0f}점)를 받았습니다."
+        if growth is None:
+            trend_str = "변화 없음(데이터 없음)"
+        elif growth > 0.1:
+            trend_str = f"상승 (+{growth:.1%})"
+        elif growth < -0.05:
+            trend_str = f"하락 ({growth:.1%})"
+        else:
+            trend_str = "소폭 변화 또는 정체"
+
+        headline = (
+            f"시장가치 흐름이 성장 잠재력을 긍정적으로 뒷받침하고 있습니다 ({score_pct})."
+            if is_strength else
+            f"최근 시장가치 흐름이 약해 성장 동력 확인이 필요합니다 ({score_pct})."
+        )
+        evidence = f"근거(Transfermarkt): 최근 시장가치 변화율 {trend_str}으로 산정되었습니다."
+        interpretation = (
+            "스카우팅 관점에서 상승 추세는 현장 평가와 이적 관심도가 함께 높아지고 있다는 간접 신호일 수 있습니다."
+            if is_strength else
+            "시장가치 정체 또는 하락은 출전 감소, 팀 내 역할 축소, 또는 평가 지연 등 다양한 요인이 복합적으로 작용한 결과일 수 있습니다."
+        )
+        direction = (
+            "현재 상승 흐름을 유지하려면 꾸준한 출전과 팀 내 핵심 역할 확보가 중요합니다."
+            if is_strength else
+            "꾸준한 출전 확보를 통해 시장가치 반등의 근거를 만드는 것이 우선 과제입니다. 임대 출전 등 실전 기회를 늘리는 방향을 검토하세요."
+        )
+        return f"{headline} {evidence} {interpretation} {direction}"
 
     if feature_name == "playing_opportunity":
         if detail.get("basis") == "minutes":
-            return f"{label}: 최근 경기에서 약 {detail.get('recent_minutes', 0):.0f}분을 출전해 {level_text} 평가({score * 100:.0f}점)를 받았습니다."
-        return f"{label}: 최근 {detail.get('recent_appearances', 0)}경기 출전 기록을 기준으로 {level_text} 평가({score * 100:.0f}점)를 받았습니다."
+            minutes_val = detail.get("recent_minutes", 0)
+            evidence_str = f"최근 경기에서 약 {minutes_val:.0f}분 출전(출전 시간 기준, Transfermarkt)"
+        else:
+            apps_val = detail.get("recent_appearances", 0)
+            evidence_str = f"최근 약 {apps_val}경기 출전(경기 수 기준, Transfermarkt)"
+
+        headline = (
+            f"꾸준한 출전 기회를 확보해 실전 경험을 쌓고 있습니다 ({score_pct})."
+            if is_strength else
+            f"출전 기회가 부족해 실전 감각 유지에 어려움이 있을 수 있습니다 ({score_pct})."
+        )
+        evidence = f"근거(Transfermarkt): {evidence_str}으로 산정되었습니다."
+        interpretation = (
+            "높은 출전 비중은 팀 내 신뢰와 역할이 확보되어 있다는 신호로 해석될 수 있습니다."
+            if is_strength else
+            "출전 부족은 자신감 저하, 경기 감각 둔화, 성장 속도 저하로 이어질 수 있습니다."
+        )
+        direction = (
+            "현재 출전 흐름을 유지하면서 역할별 기여도(득점/어시스트 외 수비 기여 등)를 함께 높이는 것이 좋습니다."
+            if is_strength else
+            "임대, 로테이션 출전 등 실질적인 출전 기회 확보 방안을 적극 검토해야 합니다. 훈련만으로는 실전 감각을 대체하기 어렵습니다."
+        )
+        return f"{headline} {evidence} {interpretation} {direction}"
 
     if feature_name == "contribution_score":
         per90 = detail.get("goal_contribution_per90", 0)
-        return f"{label}: 90분당 공격포인트(골+어시스트) {per90:.2f}를 기준으로 {level_text} 평가({score * 100:.0f}점)를 받았습니다."
+        headline = (
+            f"경기 기여도(골+어시스트)가 {lt} 평가를 받았습니다 ({score_pct}, 90분당 {per90:.2f})."
+            if is_strength else
+            f"경기 기여도(골+어시스트) 지표가 낮아 보완이 필요합니다 ({score_pct}, 90분당 {per90:.2f})."
+        )
+        evidence = f"근거(Transfermarkt): 출전 기록에서 산출한 90분당 공격 포인트(골+어시스트) {per90:.2f}를 기반으로 산정되었습니다."
+        interpretation = (
+            "공격 기여가 꾸준히 나오고 있다는 것은 팀 전술에서 핵심 공격 역할을 맡고 있음을 시사합니다."
+            if is_strength else
+            "공격 기여도가 낮다는 것이 반드시 선수 역량의 부재를 의미하지는 않습니다. 포지션 역할(수비형 미드필더 등), 출전 시간 부족, 팀 전술 등이 영향을 미쳤을 수 있습니다."
+        )
+        direction = (
+            "현재 공격 기여 흐름을 유지하면서 오프더볼 움직임, 공간 창출 역할도 함께 발전시키는 것이 좋습니다."
+            if is_strength else
+            "포지션 기준 기여 방식(어시스트보다 공간 창출 등)을 재평가하고, 결정력과 찬스 메이킹 훈련을 병행하는 것이 좋습니다."
+        )
+        return f"{headline} {evidence} {interpretation} {direction}"
 
     if feature_name == "age_potential":
         age = detail.get("age")
-        return f"{label}: 나이 {age}세는 21세 기준 성장 곡선에서 {level_text} 위치({score * 100:.0f}점)에 해당합니다."
+        age_str = f"{age}세" if age is not None else "나이 정보 없음"
+        headline = (
+            f"나이 기준 성장 잠재력이 {lt} 위치에 있습니다 ({score_pct})."
+        )
+        evidence = f"근거(DB): {age_str}는 21세 기준 성장 곡선 모델에서 {score_pct}에 해당합니다."
+        interpretation = (
+            "현재 나이는 잠재력이 가장 빠르게 실력으로 전환되는 시기에 속합니다. 이 시기의 집중 훈련과 실전 경험은 장기 성장에 큰 영향을 미칩니다."
+            if is_strength else
+            "성장 곡선상 피크 시기가 지났거나 근접한 경우, 추가 성장보다 현재 강점 유지와 효율적 역할 배분이 더 중요해질 수 있습니다."
+        )
+        direction = (
+            "현재 성장 모멘텀을 살려 실전 경험을 최대화하고, 동시에 부상 없이 훈련 강도를 단계적으로 높이는 것이 좋습니다."
+            if is_strength else
+            "나이 대비 성장 속도를 유지하려면 역할 전문화(포지션 특화 훈련)와 경험 축적을 병행하는 것이 현실적입니다."
+        )
+        return f"{headline} {evidence} {interpretation} {direction}"
 
     if feature_name == "attribute_strength":
-        return f"{label}: FM 능력치 평균이 {level_text} 수준({score * 100:.0f}점)입니다."
+        headline = (
+            f"능력치 프로필이 {lt} 수준을 보입니다 ({score_pct})."
+        )
+        evidence = "근거(능력치 데이터): 능력치 데이터에서 산출한 주요 속성 평균값입니다. 실제 경기 기록이 아닌 능력치 기반 추정값임에 유의하세요."
+        interpretation = (
+            "능력치가 높다는 것은 기술/피지컬 기반이 상대적으로 좋은 프로필에 해당한다는 의미이며, 실전 적용 가능성을 직접 보장하지는 않습니다."
+            if is_strength else
+            "능력치가 낮다는 것은 기술/피지컬 기반 항목에서 개선 여지가 있음을 시사합니다."
+        )
+        direction = (
+            "현재 능력치 강점을 실전에서 일관성 있게 발휘할 수 있도록 포지션 역할에 맞는 전술 훈련을 병행하는 것이 좋습니다."
+            if is_strength else
+            "기본 기술 및 피지컬 항목을 보완하는 훈련 계획이 필요합니다. 낮게 나온 능력치 그룹을 우선 확인하고 해당 항목 집중 훈련을 검토하세요."
+        )
+        return f"{headline} {evidence} {interpretation} {direction}"
 
     if feature_name == "mentality_strength":
-        return f"{label}: 멘탈리티 지표 평균이 {level_text} 수준({score * 100:.0f}점)입니다."
+        headline = (
+            f"멘탈·성향 지표가 {lt} 수준을 보입니다 ({score_pct})."
+        )
+        evidence = "근거(능력치 데이터): 능력치 데이터에서 산출한 멘탈 관련 속성 평균값입니다. 실제 심리 평가가 아닌 능력치 기반 참고 지표입니다."
+        interpretation = (
+            "멘탈·성향 지표가 높다는 것은 팀워크, 판단력, 압박 대처, 의지력 등 관련 속성이 상대적으로 높은 프로필임을 의미합니다."
+            if is_strength else
+            "멘탈·성향 지표가 낮다는 것은 압박 상황 대처, 집중력, 팀워크 등에서 보완이 필요한 항목이 있음을 시사합니다. 실제 선수 멘탈과 다를 수 있으므로 스카우팅 관찰과 함께 판단하세요."
+        )
+        direction = (
+            "멘탈 강점을 경기에서 일관성 있게 발휘하려면 고압적 상황(막판 동점/역전 위기 등)에서의 판단 훈련이 도움이 됩니다."
+            if is_strength else
+            "압박 상황에서의 첫 터치 방향, 주변 시야 확보, 팀워크 강화 훈련을 코칭에 포함하는 것이 좋습니다."
+        )
+        return f"{headline} {evidence} {interpretation} {direction}"
 
-    return f"{label}: {level_text} 평가({score * 100:.0f}점)입니다."
+    return f"{label}: {lt} 평가({score_pct})입니다."
 
 
 def build_strengths(features):
@@ -80,6 +214,20 @@ def build_strengths(features):
         strengths.append("현재 데이터 기준으로는 뚜렷하게 두드러지는 강점 지표가 확인되지 않았습니다.")
 
     return strengths
+
+
+def build_strengths_with_meta(features):
+    """강점 항목을 (text, source_badges) 튜플 리스트로 반환한다. UI badge 표시용."""
+    items = []
+    for feature_name, feature_result in features.items():
+        if feature_result.get("status") == "ok" and feature_result["score"] >= 0.6:
+            items.append((
+                explain_feature_score(feature_name, feature_result),
+                FEATURE_SOURCE_BADGES.get(feature_name, ["데이터 기반 분석"]),
+            ))
+    if not items:
+        items.append(("현재 데이터 기준으로는 뚜렷하게 두드러지는 강점 지표가 확인되지 않았습니다.", ["데이터 기반 분석"]))
+    return items
 
 
 def build_risks(features, risk_penalty=None):
@@ -98,6 +246,23 @@ def build_risks(features, risk_penalty=None):
     return risks
 
 
+def build_risks_with_meta(features, risk_penalty=None):
+    """리스크 항목을 (text, source_badges) 튜플 리스트로 반환한다. UI badge 표시용."""
+    items = []
+    for feature_name, feature_result in features.items():
+        if feature_result.get("status") == "ok" and feature_result["score"] < 0.4:
+            items.append((
+                explain_feature_score(feature_name, feature_result),
+                FEATURE_SOURCE_BADGES.get(feature_name, ["데이터 기반 분석"]),
+            ))
+    if risk_penalty:
+        for note in risk_penalty.get("notes", []):
+            items.append((note, ["성장 가능성 모델"]))
+    if not items:
+        items.append(("현재 데이터 기준으로는 특별히 두드러지는 리스크 요인이 확인되지 않았습니다.", ["데이터 기반 분석"]))
+    return items
+
+
 def build_recommendations(features, player_context=None):
     """feature 결과를 바탕으로 추천 성장 방향을 만든다."""
     player_context = player_context or {}
@@ -105,31 +270,64 @@ def build_recommendations(features, player_context=None):
 
     market = features.get("market_momentum", {})
     if market.get("status") == "ok" and market["score"] < 0.4:
-        recommendations.append("최근 시장가치 흐름이 약한 편이므로, 꾸준한 출전을 통해 시장가치 반등의 계기를 만드는 것이 중요합니다.")
+        recommendations.append(
+            "우선 훈련 목표: 출전 기회를 통한 시장가치 반등 기반 마련. "
+            "왜 필요한가: 최근 시장가치 흐름이 약해 꾸준한 출전이 가장 직접적인 반등 신호가 됩니다(Transfermarkt 기반). "
+            "훈련 방향: 팀 내 역할을 유지하면서 임대 등 출전 기회를 적극 확보하세요. "
+            "관찰 지표: 시장가치 변화율, 최근 출전 경기 수."
+        )
 
     playing = features.get("playing_opportunity", {})
     if playing.get("status") == "ok" and playing["score"] < 0.4:
-        recommendations.append("출전 시간이 부족한 편이므로, 임대 등 출전 기회를 늘릴 수 있는 환경을 우선 검토하는 것이 좋습니다.")
+        recommendations.append(
+            "우선 훈련 목표: 실전 출전 기회 확보. "
+            "왜 필요한가: 출전 시간이 부족하면 경기 감각과 판단 속도가 둔화되어 성장 정체로 이어질 수 있습니다(Transfermarkt 기반). "
+            "훈련 방향: 임대, 로테이션 출전 등을 통해 실질적인 출전 기회를 늘리고, 훈련만으로는 실전 감각을 대체하기 어렵다는 점을 인식하세요. "
+            "관찰 지표: 최근 경기 출전 시간, 출전 경기 수."
+        )
 
     contribution = features.get("contribution_score", {})
     if contribution.get("status") == "ok" and contribution["score"] < 0.4:
         position = player_context.get("position") or "현재 포지션"
-        recommendations.append(f"{position} 기준 기여도가 낮은 편이므로 결정력, 오프더볼 움직임, 패스 선택, 판단 속도, 찬스 메이킹을 개선하는 훈련이 필요합니다.")
+        recommendations.append(
+            f"우선 훈련 목표: {position} 기준 경기 기여도(골+어시스트) 향상. "
+            "왜 필요한가: 90분당 공격 포인트가 낮은 편으로, 결정적 장면에서의 영향력이 제한적일 수 있습니다(Transfermarkt 기반). "
+            "훈련 방향: 결정력, 오프더볼 움직임, 패스 선택, 판단 속도, 찬스 메이킹 훈련을 집중적으로 진행하세요. 포지션 역할에 따라 기여 방식(어시스트 vs 공간 창출)을 구분해서 접근하세요. "
+            "관찰 지표: 90분당 골+어시스트, 슈팅 정확도, 키패스 수."
+        )
 
     attribute = features.get("attribute_strength", {})
     if attribute.get("status") == "ok" and attribute["score"] < 0.4:
-        recommendations.append("FM 능력치 평균이 낮은 편이므로, 기본 기술/피지컬 항목을 보완하는 훈련 계획이 도움이 될 수 있습니다.")
+        recommendations.append(
+            "우선 훈련 목표: 기술/피지컬 능력치 보완. "
+            "왜 필요한가: 능력치 평균이 낮은 편으로, 기본 기술/피지컬 기반을 강화할 필요가 있습니다. "
+            "훈련 방향: 낮게 나온 능력치 그룹(기술, 피지컬, 멘탈 등)을 우선 식별하고, 해당 항목을 집중 훈련하세요. "
+            "관찰 지표: 능력치 평균 변화, 특정 속성 그룹 개선 여부."
+        )
 
     mentality = features.get("mentality_strength", {})
     if mentality.get("status") == "ok" and mentality["score"] < 0.4:
-        recommendations.append("멘탈리티 지표가 낮은 편이므로, 압박 상황 대처/팀워크 관련 코칭을 함께 병행하는 것이 좋습니다.")
+        recommendations.append(
+            "우선 훈련 목표: 압박 상황 대처 및 팀워크 강화. "
+            "왜 필요한가: 멘탈·성향 지표가 낮은 편으로, 고압적 상황에서의 판단력과 팀 협업 측면에서 개선 여지가 있습니다. "
+            "훈련 방향: 고압 상황에서의 첫 터치, 주변 시야 확보, 수비 전환 타이밍 훈련을 코칭에 포함하세요. "
+            "관찰 지표: 멘탈 관련 능력치 변화, 경기 중 실수 빈도, 팀워크 평가."
+        )
 
     age = features.get("age_potential", {})
     if age.get("status") == "ok" and age["score"] >= 0.6:
-        recommendations.append("나이 기준 성장 곡선상 유리한 시기이므로, 현재의 강점을 꾸준히 실전에서 활용하며 성장 속도를 유지하는 것이 좋습니다.")
+        recommendations.append(
+            "우선 훈련 목표: 현재 성장 모멘텀 극대화. "
+            "왜 필요한가: 나이 기준 성장 곡선상 유리한 시기에 있어 집중 투자의 효과가 클 수 있습니다(DB 기반 나이 곡선 모델). "
+            "훈련 방향: 강점 항목을 꾸준히 실전에서 활용하면서, 부상 없이 훈련 강도를 단계적으로 높이는 것이 좋습니다. "
+            "관찰 지표: 출전 시간, 시장가치 흐름, 성장 곡선상 위치."
+        )
 
     if not recommendations:
-        recommendations.append("현재 데이터 기준으로는 특정 항목을 우선 개선하기보다 현재 흐름을 유지하며 다음 시점의 데이터를 함께 관찰하는 것이 좋습니다.")
+        recommendations.append(
+            "현재 데이터 기준으로는 특정 항목 우선 개선보다 현재 흐름을 유지하는 것이 좋습니다. "
+            "출전 시간과 시장가치 추이를 지속적으로 관찰하면서, 다음 시점 데이터와 함께 재평가하는 것이 권장됩니다."
+        )
 
     return recommendations
 
@@ -146,19 +344,19 @@ def _score_reason_data_driven(features, growth_score):
         return "현재 사용 가능한 데이터가 없어 Growth Score를 산정할 수 없습니다."
 
     top = available[:2]
-    top_text = ", ".join(f"{FEATURE_LABELS.get(name, name)}({contribution:.1f}점 기여)" for name, contribution in top)
+    top_text = ", ".join(f"{_label(name)}({contribution:.1f}점 기여)" for name, contribution in top)
 
     bottom = [item for item in available if item[1] is not None and item[1] < (GROWTH_WEIGHTS[item[0]] * 100 * 0.4)]
-    unavailable = [FEATURE_LABELS.get(name, name) for name, result in features.items() if result.get("status") == "unavailable"]
+    unavailable = [_label(name) for name, result in features.items() if result.get("status") == "unavailable"]
 
     reason = f"Growth Score({growth_score})는 주로 {top_text} 항목의 기여로 산정되었습니다."
 
     if bottom:
-        bottom_text = ", ".join(FEATURE_LABELS.get(name, name) for name, _ in bottom)
+        bottom_text = ", ".join(_label(name) for name, _ in bottom)
         reason += f" 반면 {bottom_text} 항목은 기여가 낮아 점수를 끌어내리는 요인이 되었습니다."
 
     if unavailable:
-        reason += f" {', '.join(unavailable)} 항목은 데이터가 없어 평가에서 제외되었고, 남은 항목들의 비중을 재정규화해 계산했습니다."
+        reason += f" {', '.join(unavailable)} 항목은 데이터가 없어 평가에서 제외되었고, 남은 항목들의 비중을 재조정해 계산했습니다."
 
     return reason
 
@@ -185,9 +383,12 @@ def _build_data_driven_explanation(growth_insight, player_context):
     data_limitations = []
     for feature_name, feature_result in features.items():
         if feature_result.get("status") == "unavailable":
-            label = FEATURE_LABELS.get(feature_name, feature_name)
+            feat_label = _label(feature_name)
             reason = feature_result.get("detail", {}).get("reason", "데이터가 부족합니다.")
-            data_limitations.append(f"{label} 항목: {reason}")
+            reason = reason.replace("FM 프로필이 없습니다.", "능력치 프로필이 없습니다.")
+            reason = reason.replace("attributes_jsonb", "능력치 데이터")
+            reason = reason.replace("mentality_jsonb", "멘탈 데이터")
+            data_limitations.append(f"{feat_label} 항목: {reason}")
 
     if not data_limitations:
         data_limitations.append("모든 feature 항목에 사용 가능한 데이터가 있습니다.")
@@ -214,25 +415,26 @@ def _build_manual_explanation(growth_insight, player_context):
     risk_level = levels["risk_tendency"]
 
     summary = (
-        f"직접 입력한 조건 기준으로 Growth Score는 {growth_score}점입니다. "
+        f"직접 입력한 능력치와 환경 설정을 기반으로 Growth Score {growth_score}점이 계산되었습니다. "
         f"훈련강도 '{training_level}', 리그난이도 '{league_level}', 출전기회 '{playing_level}', "
-        f"리스크성향 '{risk_level}' 조건을 종합한 prototype 점수입니다. "
+        f"리스크성향 '{risk_level}' 조건을 종합한 성장 평가입니다. "
         f"{ENTITY_TYPE_CONTEXT_NOTES['manual_note']}"
     )
 
+    _KEY_KO = {"training_intensity": "훈련강도", "playing_opportunity": "출전기회", "league_level": "리그수준"}
     score_reason_parts = []
     for key, level_label in [
         ("training_intensity", training_level),
         ("playing_opportunity", playing_level),
         ("league_level", league_level),
     ]:
-        score_reason_parts.append(f"{level_label} {LEVEL_DESCRIPTIONS[key][level_label]}")
+        score_reason_parts.append(f"{_KEY_KO.get(key, key)} '{level_label}': {LEVEL_DESCRIPTIONS[key][level_label]}")
     score_reason_parts.append(f"리스크성향 '{risk_level}': {LEVEL_DESCRIPTIONS['risk_tendency'][risk_level]}")
 
     if scores.get("self_attribute") is not None:
-        score_reason_parts.append(f"직접 입력한 능력치 평균이 자기평가 점수({scores['self_attribute'] * 100:.0f}점)에 반영되었습니다.")
+        score_reason_parts.append(f"직접 입력한 능력치 평균이 능력치 점수({scores['self_attribute'] * 100:.0f}점)에 반영되었습니다.")
     else:
-        score_reason_parts.append("능력치 입력값이 없어 self_attribute 항목은 평가에서 제외되고 나머지 항목 weight가 재정규화되었습니다.")
+        score_reason_parts.append("능력치 입력값이 없어 능력치 점수 항목은 평가에서 제외되고 나머지 항목 비중이 재조정되었습니다.")
 
     score_reason = " ".join(score_reason_parts)
 
@@ -270,10 +472,10 @@ def _build_manual_explanation(growth_insight, player_context):
         recommendations.append("현재 입력 조건은 비교적 균형 잡혀 있습니다. 출전 시간을 안정적으로 확보하면서 현재 성장 속도를 유지하는 것이 좋습니다.")
 
     data_limitations = [
-        "manual_note는 실제 DB(player_valuations/appearances/player_profiles) 기반 예측이 아니라, 사용자가 직접 입력한 조건 기반 prototype 점수입니다.",
+        "직접 입력한 능력치와 환경 설정 기반 분석입니다. 시장가치 및 실제 출전 기록은 참조 선수가 연결된 경우에만 표시됩니다.",
     ]
     if scores.get("self_attribute") is None:
-        data_limitations.append("능력치 입력값이 없어 self_attribute 항목은 제외되었습니다.")
+        data_limitations.append("능력치 입력값이 없어 능력치 점수 항목은 제외되었습니다.")
 
     return {
         "summary": summary,

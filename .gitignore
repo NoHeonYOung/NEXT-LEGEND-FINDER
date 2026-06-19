@@ -4,8 +4,11 @@ __pycache__/
 *.pyc
 .env
 *.log
+*.tmp
+.pytest_cache/
 .claude/
 CLAUDE*.md
 app_backup_before_*.py
 views/*.tmp.*
 views/*_backup_before_*.py
+/archive/

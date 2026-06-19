@@ -5,6 +5,53 @@
 
 ---
 
+## v19 Final Folder Organization: docs archive and root cleanup
+
+- docs/ 폴더 구조(specs/tasks/reports/archive) 생성 및 문서 이동 완료.
+- Growth Model 공식, Ceiling Model 공식, DB 스키마, API key, 원본 CSV는 변경하지 않았다.
+- 91 tests passed, 0 failed.
+
+---
+
+## v19 Final Polish and Cleanup: explanation engine 강화 및 소스 배지 통합
+
+### Explanation Engine 변경 사항
+
+- `explain_feature_score()`: 6개 feature 모두 4-part 구조화 텍스트(핵심/근거/해석/방향)로 확장.
+  - Transfermarkt 기반 feature: market_momentum, playing_opportunity, contribution_score — Transfermarkt 데이터 근거 명시.
+  - DB 기반 feature: age_potential — 나이 커브 근거 명시.
+  - FM proxy 기반 feature: attribute_strength, mentality_strength — FM proxy 추정값임을 명시.
+- `FEATURE_SOURCE_BADGES` dict: feature → 소스 배지 레이블 매핑. dashboard, ai_report에서 배지 표시에 활용.
+- `build_strengths_with_meta()`, `build_risks_with_meta()`: 텍스트 + 배지 메타데이터 함께 반환.
+- `build_recommendations()`: 4-part 구조화 텍스트(우선 목표/왜 필요/훈련 방향/관찰 지표)로 확장.
+
+### 소스 배지 표시 규칙
+
+| 소스 | 의미 |
+|------|------|
+| `Transfermarkt` | 시장가치, 출전기록, 기여도 기반 수치 |
+| `FM proxy` | Football Manager 능력치_jsonb / 멘탈리티_jsonb 추정값 (실제 경기 데이터 아님) |
+| `Growth Model` | market_momentum / playing_opportunity / contribution_score / age_potential 기반 규칙 점수 |
+| `Rule-based` | 규칙 기반 추천 / 훈련 방향 (Gemini 아님) |
+| `Ceiling Scenario` | α/γ/β/training_multiplier/Δleague 공식 기반 시나리오 |
+| `style_vector` | 24차원 FM proxy 벡터 (실제 위치 이벤트 데이터 아님) |
+| `DB` | 나이, 기본 인적사항 등 DB 직접 수치 |
+
+---
+
+## v19 UI Redesign Phase C: Style & Mentor Lab and Scouting Notes styling
+
+- `views/legend_matching.py`가 Style & Mentor Lab으로 재작성되었다.
+- pgvector style_vector gating, mentor age filter(기본/완화), similarity 결과 card grid, mentor 후보 card grid, selected mentor 요약 패널을 적용했다.
+- `views/scouting_notes.py`가 Scouting Archive로 재작성되었다.
+- Archive Summary Strip(5종 통계), Filter Panel, game archive note card list, 7섹션 Note Detail Panel을 적용했다.
+- `components/cards.py`에 `similarity_card_html`, `mentor_card_html`, `archive_note_card_html`, `empty_state_panel_html`, `score_bar_html` 추가.
+- `styles/game_ui.css`에 Phase C 전용 CSS 클래스 추가.
+- DB schema, secrets/env, Growth/Ceiling 공식, Gemini 역할, Notes payload/legacy fallback은 변경하지 않았다.
+- Manual Prospect, DB Status 화면 전체 개편은 아직 하지 않았다.
+
+---
+
 ## v19 Phase 1~2 추가: Scouting Board / Player Dossier 제품 UX 정리
 
 ### Scouting Board 기본 정책
@@ -857,3 +904,53 @@ report_generation_mode = "rule_based_with_gemini" if has_gemini else "rule_based
 - "테스트용 정성 텍스트 입력 예시" expander에서 3가지 예시가 표시되는지 확인
 - API key 있을 때 신호 추출 → 보조 추천 버튼 순차 활성화 흐름 확인
 - 저장 후 My Scouting Notes 개발자 expander에서 `report_generation_mode` 값 확인
+# v19 UI Redesign Phase A: Game-style shell, Scouting Board, and Player Dossier
+
+이번 단계는 모델 계산 변경이 아니라 제품 UI shell 개편이다. Growth Model, Ceiling Model, Data Coverage classifier, Gemini 보조 분석, Notes 저장 구조는 그대로 유지한다.
+
+공통 UI 구조:
+- `components/`를 추가해 layout, cards, badges, player header, attribute panel helper를 분리했다.
+- `styles/`를 추가해 `game_ui.css`와 CSS loader를 분리했다.
+- 기존 `theme.py`는 새 CSS를 로드한 뒤 기존 dark theme CSS도 유지한다.
+- `app.py`는 라우터 역할을 유지하며 사이드바 브랜드 호출만 추가했다.
+
+Scouting Board 적용:
+- `render_game_page_title()`로 page title을 custom game-style header로 표시한다.
+- 검색/필터 로직과 `profile_id.notna()` 후처리 필터는 유지한다.
+- 결과 영역에 Full/Partial/Limited count를 보여주는 compact stat strip을 추가했다.
+- 기존 후보 카드와 coverage badge는 새 CSS 토큰을 통해 어두운 scouting board card처럼 보이게 조정했다.
+
+Player Dossier 적용:
+- `render_game_page_title()`로 dossier title을 custom header로 표시한다.
+- `ui_components.render_player_profile_panel()`은 `components.player_header.render_player_header()`로 위임해 top selected-player header를 공통화했다.
+- FM attribute가 있는 경우 실제 attribute 값으로 progress bar snapshot을 표시한다.
+- Growth Insight 계산, session_state 저장, Data Coverage Panel, provenance expander는 유지한다.
+
+아직 적용하지 않은 화면:
+- Style & Mentor Lab
+- Career Simulation
+- Evidence & Advisory Report
+- My Scouting Notes
+- Manual Prospect
+- DB Status
+
+모델 불변성:
+- Growth Score 공식과 feature weight는 변경하지 않았다.
+- Ceiling Scenario Adjustment 공식과 범위는 변경하지 않았다.
+- DB schema, secrets/env, 원본 CSV, `create_and_upload_db.py`는 변경하지 않았다.
+# v19 UI Redesign Phase A.1 note
+
+Phase A.1 changed presentation only. It moved duplicated theme CSS into `styles/game_ui.css`, polished Scouting Board and Player Dossier panels, and did not change Growth Model, Ceiling Model, DB schema, Supabase access, Gemini scoring boundaries, or scouting_notes persistence.
+# v19 UI Redesign Phase B note
+
+Phase B changed presentation only for Career Simulation and Evidence & Advisory Report. The Growth Model formula, Ceiling Scenario Adjustment formula and range, Gemini role boundaries, Supabase access, and scouting_notes payload structure were preserved. Gemini remains limited to qualitative signal extraction and evidence-based advisory text; it does not calculate or override Growth/Ceiling scores.
+# v19 Final User Flow Fix note
+
+This polish pass did not change the real Growth Model or Ceiling Model formulas. It only changed user-facing flow and labels:
+- Career Simulation descriptive choices map back to the existing numeric `training_intensity` and `playing_time_opportunity` values before calling the existing simulation/Growth/Ceiling helpers.
+- Gemini failure handling now shows a friendly fallback notice while keeping raw API errors in a developer expander.
+- Qualitative text remains supplemental evidence. It can inform displayed mental/attitude/risk commentary but never calculates or overrides Growth/Ceiling scores.
+- Scouting Board defaults to players with ability profiles; Limited/basic-info candidates are advanced options.
+- Mentor Matching Lab prioritizes age-filtered mentor candidates while keeping similarity references hidden in an expander.
+
+Unchanged: DB schema, secrets/env, original CSV, style_vector calculation, pgvector query, Growth/Ceiling score formulas and ranges, Notes persistence payload and legacy fallback.
